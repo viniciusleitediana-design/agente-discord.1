@@ -25,10 +25,20 @@ Variáveis de ambiente (Render → Environment)
 - CONFIG_CANAL_ID  opcional: canal onde as automações ficam salvas
                    (padrão: cria o canal privado #agente-config)
 
+Loja (compra em chat privado com Pix)
+- PIX_CHAVE        chave Pix que recebe os pagamentos (e-mail, celular no formato
+                   +5511999999999, CPF/CNPJ só números ou chave aleatória). Com ela o
+                   bot gera o QR Code e o "copia e cola" com o valor de cada produto.
+- PIX_NOME         opcional: nome que aparece no Pix (padrão ECO PULSE, até 25 letras)
+- PIX_CIDADE       opcional: cidade do Pix (padrão SAO PAULO, até 15 letras)
+- PIX_COPIA_COLA   opcional: código Pix fixo pronto (usado no lugar da PIX_CHAVE;
+                   o valor dele não muda com o preço do produto)
+
 Comando de início no Render: python server.py
 """
 
 import asyncio
+import io
 import json
 import logging
 import math
@@ -62,7 +72,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "2.0"
+VERSAO = "2.1"
 INICIO = time.time()
 
 
@@ -89,6 +99,10 @@ API = (_env("DISCORD_API", padrao="https://discord.com/api/v10")).rstrip("/")
 PORTA = int(_env("PORT", padrao="10000"))
 MANTER_ACORDADO = (_env("MANTER_ACORDADO", padrao="1") or "1").lower() not in ("0", "false", "nao", "não", "off")
 CONFIG_CANAL_ID = _env("CONFIG_CANAL_ID")
+PIX_CHAVE = _env("PIX_CHAVE", "CHAVE_PIX")
+PIX_NOME = _env("PIX_NOME", padrao="ECO PULSE")
+PIX_CIDADE = _env("PIX_CIDADE", padrao="SAO PAULO")
+PIX_COPIA_COLA = _env("PIX_COPIA_COLA")
 
 NOME_CANAL_CONFIG = "agente-config"
 ARQUIVO_CONFIG = "agente-config.json"
@@ -166,8 +180,11 @@ def _resumir_erros(erros: Any, caminho: str = "") -> list[str]:
 
 
 async def dc(metodo: str, caminho: str, *, corpo: Any = None, params: dict | None = None,
-             dados: dict | None = None, arquivos: dict | None = None, motivo: str | None = None) -> Any:
-    """Chama a API REST do Discord, respeitando o limite de requisições."""
+             dados: dict | None = None, arquivos: dict | None = None, motivo: str | None = None,
+             autenticar: bool = True) -> Any:
+    """Chama a API REST do Discord, respeitando o limite de requisições.
+    autenticar=False é para as rotas de resposta a botões (/interactions e /webhooks), que usam o
+    token da própria interação em vez do token do bot."""
     if not TOKEN:
         raise ErroDiscord("O token do bot não está configurado. No Render, crie a variável DISCORD_TOKEN "
                           "com o token do bot (Developer Portal → Bot → Reset Token).")
@@ -175,8 +192,12 @@ async def dc(metodo: str, caminho: str, *, corpo: Any = None, params: dict | Non
     resp = None
     for tentativa in range(5):
         try:
-            resp = await cliente_api().request(metodo, caminho, json=corpo, params=params,
-                                               data=dados, files=arquivos, headers=headers)
+            if autenticar:
+                resp = await cliente_api().request(metodo, caminho, json=corpo, params=params,
+                                                   data=dados, files=arquivos, headers=headers)
+            else:
+                resp = await cliente_web().request(metodo, API + caminho, json=corpo, params=params,
+                                                   data=dados, files=arquivos)
         except httpx.HTTPError as erro:
             if tentativa < 2:
                 await asyncio.sleep(1.5)
@@ -568,7 +589,8 @@ def _link_canal(gid: str, cid: str, mid: str | None = None) -> str:
 # ───────────────────────── memória das automações (salva no próprio Discord) ─────────────────────────
 
 CONFIG_PADRAO: dict[str, Any] = {"versao": 1, "agendadas": [], "boas_vindas": {}, "despedida": {},
-                                 "respostas": [], "cargos_reacao": [], "logs": {}}
+                                 "respostas": [], "cargos_reacao": [], "logs": {},
+                                 "produtos": {}, "compras": {}}
 _cfg: dict[str, Any] = deepcopy(CONFIG_PADRAO)
 _cfg_estado: dict[str, Any] = {"carregada": False, "canal_id": None, "msg_id": None, "aviso": None, "tentativa": 0.0}
 _cfg_lock = asyncio.Lock()
@@ -789,6 +811,12 @@ async def loop_agendador() -> None:
             raise
         except Exception:
             log.exception("Erro no agendador")
+        try:
+            await fechar_compras()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Erro ao fechar chats de compra")
         await asyncio.sleep(20)
 
 
@@ -902,6 +930,652 @@ async def ao_reagir(mensagem_id: str, emoji_chave: str, uid: str, adicionou: boo
                 await registrar(f"⚠️ Cargo por reação falhou para <@{uid}>: {erro}")
 
 
+# ───────────────────────── loja: compra em chat privado com Pix ─────────────────────────
+#
+# Fluxo: botão "Comprar agora" no painel → o bot cria um chat privado (comprador + cargo aprovador)
+# com o QR Code e o "copia e cola" do Pix → o comprador clica em "Confirmar pagamento" e digita o
+# nome completo → o aprovador (Fundador) confirma ou recusa → confirmado: o produto vai por DM
+# automaticamente; recusado: o chat é fechado. Tudo fica salvo na memória (#agente-config), então
+# os botões continuam funcionando depois que o Render reinicia.
+
+ESPERA_PAGAMENTO = timedelta(hours=24)        # chat sem pagamento informado fecha sozinho
+FECHAR_APOS_ENTREGA = timedelta(minutes=5)
+FECHAR_APOS_RECUSA = timedelta(minutes=1)
+FECHAR_APOS_CANCELAR = timedelta(seconds=10)
+GERENCIAR_MSG, EMBED_LINKS = PERMISSOES["gerenciar_mensagens"], PERMISSOES["inserir_links"]
+STATUS_ABERTOS = ("aguardando", "analise", "entregando")
+_loja_lock = asyncio.Lock()
+_estoque_lock = asyncio.Lock()
+
+
+def _slug(texto: Any, limite: int = 40) -> str:
+    s = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")[:limite].strip("-")
+
+
+def _ler_preco(valor: Any) -> float:
+    s = str(valor).lower().replace("r$", "").replace(" ", "").strip()
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        n = round(float(s), 2)
+    except ValueError:
+        raise ErroDiscord(f'Preço "{valor}" inválido. Use algo como 19,90.')
+    if n <= 0 or n > 100000:
+        raise ErroDiscord(f'Preço "{valor}" fora do normal.')
+    return n
+
+
+def _reais(valor: float | None) -> str:
+    if not valor:
+        return "a combinar"
+    return "R$ " + f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _campo_emv(id_: str, valor: str) -> str:
+    return f"{id_}{len(valor):02d}{valor}"
+
+
+def _crc16(texto: str) -> str:
+    """CRC16-CCITT (0x1021, início 0xFFFF), o mesmo que o Banco Central usa no Pix."""
+    crc = 0xFFFF
+    for byte in texto.encode("utf-8"):
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else (crc << 1)
+            crc &= 0xFFFF
+    return f"{crc:04X}"
+
+
+def _ascii_pix(texto: str, limite: int, padrao: str) -> str:
+    s = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode()
+    s = re.sub(r"[^A-Za-z0-9 ]", "", s).strip().upper()
+    return s[:limite].strip() or padrao
+
+
+def gerar_pix(valor: float | None, txid: str) -> str | None:
+    """Monta o Pix "copia e cola" (BR Code estático) com a chave do Render e o valor do produto."""
+    if PIX_COPIA_COLA:
+        return PIX_COPIA_COLA
+    if not PIX_CHAVE:
+        return None
+    chave = PIX_CHAVE.strip()
+    if "@" in chave:
+        chave = chave.lower()
+    conta = _campo_emv("00", "br.gov.bcb.pix") + _campo_emv("01", chave)
+    corpo = _campo_emv("00", "01") + _campo_emv("26", conta) + _campo_emv("52", "0000") + _campo_emv("53", "986")
+    if valor:
+        corpo += _campo_emv("54", f"{valor:.2f}")
+    corpo += _campo_emv("58", "BR") + _campo_emv("59", _ascii_pix(PIX_NOME, 25, "ECO PULSE"))
+    corpo += _campo_emv("60", _ascii_pix(PIX_CIDADE, 15, "SAO PAULO"))
+    corpo += _campo_emv("62", _campo_emv("05", re.sub(r"[^A-Za-z0-9]", "", txid)[:25] or "***"))
+    corpo += "6304"
+    return corpo + _crc16(corpo)
+
+
+def _qr_png(texto: str) -> bytes | None:
+    try:
+        import segno
+        buf = io.BytesIO()
+        segno.make_qr(texto, error="m").save(buf, kind="png", scale=8, border=3)
+        return buf.getvalue()
+    except Exception as erro:
+        log.warning("Não consegui gerar o QR Code localmente (%s); usando gerador online.", erro)
+        return None
+
+
+def _qr_url_online(texto: str) -> str:
+    return "https://api.qrserver.com/v1/create-qr-code/?size=420x420&margin=12&data=" + quote(texto, safe="")
+
+
+def _botao(rotulo: str, custom_id: str, estilo: int = 1, emoji: str | None = None) -> dict:
+    b: dict[str, Any] = {"type": 2, "style": estilo, "label": rotulo[:80], "custom_id": custom_id[:100]}
+    if emoji:
+        b["emoji"] = {"name": emoji}
+    return b
+
+
+def _linha(*botoes: dict) -> dict:
+    return {"type": 1, "components": list(botoes)[:5]}
+
+
+def _botoes_decisao() -> dict:
+    return _linha(_botao("Confirmar", "ecop:aprovar", 3, "✅"), _botao("Recusar", "ecop:recusar", 4, "❌"))
+
+
+def _valor_modal(no: Any, custom_id: str) -> str | None:
+    if isinstance(no, dict):
+        if no.get("custom_id") == custom_id and "value" in no:
+            return str(no["value"])
+        for v in no.values():
+            achado = _valor_modal(v, custom_id)
+            if achado is not None:
+                return achado
+    elif isinstance(no, list):
+        for v in no:
+            achado = _valor_modal(v, custom_id)
+            if achado is not None:
+                return achado
+    return None
+
+
+def _ids_cargos(membro: Any) -> set[str]:
+    ids: set[str] = set()
+    for r in getattr(membro, "roles", None) or []:
+        ids.add(str(getattr(r, "id", r)))
+    for r in getattr(membro, "_roles", None) or []:
+        ids.add(str(r))
+    return ids
+
+
+def _pode_aprovar(inter: Any, prod: dict) -> bool:
+    guild = getattr(inter, "guild", None)
+    if guild is not None and getattr(guild, "owner_id", None) == inter.user.id:
+        return True
+    aprov = prod.get("cargo_aprovador_id")
+    return bool(aprov) and aprov in _ids_cargos(inter.user)
+
+
+def _partes(texto: str, tamanho: int = 1900) -> list[str]:
+    return [texto[i:i + tamanho] for i in range(0, len(texto), tamanho)] or [""]
+
+
+def _com_rodape(embed: dict, texto: str, cor: int | None = None) -> dict:
+    novo = deepcopy(embed)
+    novo["footer"] = {"text": texto[:2048]}
+    if cor is not None:
+        novo["color"] = cor
+    return novo
+
+
+def _embed_da_mensagem(inter: Any) -> dict:
+    try:
+        return inter.message.embeds[0].to_dict()
+    except Exception:
+        return {"title": "🧾 Pagamento informado", "color": CORES["amarelo"]}
+
+
+class _Resposta:
+    """Responde a um clique de botão/formulário pela API (o Discord dá 3 segundos para a 1ª resposta)."""
+
+    def __init__(self, inter: Any):
+        self.inter = inter
+        self.feita = False
+        self.adiada = False
+
+    async def enviar(self, tipo: int, dados: dict | None = None) -> None:
+        corpo: dict[str, Any] = {"type": tipo}
+        if dados is not None:
+            corpo["data"] = dados
+        await dc("POST", f"/interactions/{self.inter.id}/{self.inter.token}/callback", corpo=corpo, autenticar=False)
+        self.feita = True
+
+    async def adiar(self) -> None:
+        """'Pensando…' só para quem clicou (para tarefas que demoram mais de 3 segundos)."""
+        await self.enviar(5, {"flags": 64})
+        self.adiada = True
+
+    async def editar_original(self, dados: dict) -> None:
+        await dc("PATCH", f"/webhooks/{self.inter.application_id}/{self.inter.token}/messages/@original",
+                 corpo=dados, autenticar=False)
+
+    async def efemera(self, texto: str) -> None:
+        dados = {"content": texto[:2000], "allowed_mentions": {"parse": []}}
+        if self.adiada:
+            self.adiada = False
+            await self.editar_original(dados)
+        elif self.feita:
+            await dc("POST", f"/webhooks/{self.inter.application_id}/{self.inter.token}",
+                     corpo={**dados, "flags": 64}, autenticar=False)
+        else:
+            await self.enviar(4, {**dados, "flags": 64})
+
+
+async def _canal_existe(canal_id: str) -> bool:
+    try:
+        await dc("GET", f"/channels/{canal_id}")
+        return True
+    except ErroDiscord as erro:
+        if erro.status == 404 or erro.codigo == 10003:
+            return False
+        return True
+
+
+async def _registrar_venda(prod: dict, texto: str) -> None:
+    canal = prod.get("canal_vendas_id")
+    if canal:
+        try:
+            await dc("POST", f"/channels/{canal}/messages", corpo={"content": texto[:2000], "allowed_mentions": {"parse": []}})
+        except ErroDiscord as erro:
+            log.warning("Falha ao registrar venda: %s", erro)
+    if (_cfg.get("logs") or {}).get("canal_id") != canal:
+        await registrar(texto)
+
+
+async def _criar_canal_compra(prod: dict, uid: str, nome_exibicao: str, usuario: str) -> dict:
+    gid, bot = await servidor_id(), await eu()
+    base = prod.get("prefixo_canal") or f'compra-{prod["id"]}'
+    sufixo = _slug(nome_exibicao, 30) or _slug(usuario, 30) or uid[-6:]
+    nome = f"{base}-{sufixo}"[:100]
+    perms: list[dict[str, Any]] = [
+        {"id": gid, "type": 0, "allow": "0", "deny": str(VER)},
+        {"id": uid, "type": 1, "allow": str(VER | ENVIAR | HISTORICO | ANEXAR), "deny": "0"},
+        {"id": bot["id"], "type": 1, "allow": str(VER | ENVIAR | HISTORICO | ANEXAR | EMBED_LINKS | GERENCIAR_MSG), "deny": "0"},
+    ]
+    if prod.get("cargo_aprovador_id"):
+        perms.append({"id": prod["cargo_aprovador_id"], "type": 0,
+                      "allow": str(VER | ENVIAR | HISTORICO | ANEXAR | GERENCIAR_MSG), "deny": "0"})
+    corpo: dict[str, Any] = {"name": nome, "type": 0, "permission_overwrites": perms,
+                             "topic": f'Compra de {prod["nome"]} • comprador <@{uid}> • chat privado: só você e a equipe veem'}
+    if prod.get("categoria_id"):
+        corpo["parent_id"] = prod["categoria_id"]
+    motivo = f'Compra de {prod["nome"]}'
+    try:
+        return await dc("POST", f"/guilds/{gid}/channels", corpo=corpo, motivo=motivo)
+    except ErroDiscord as erro:
+        if erro.codigo != 50035:
+            raise
+    # nome recusado (ex.: caractere não aceito) ou categoria cheia: tenta de novo mais simples
+    corpo["name"] = re.sub(r"[^a-z0-9_-]+", "-", nome.lower()).strip("-")[:100] or f"compra-{uid[-6:]}"
+    try:
+        return await dc("POST", f"/guilds/{gid}/channels", corpo=corpo, motivo=motivo)
+    except ErroDiscord as erro:
+        if erro.codigo != 50035 or "parent_id" not in corpo:
+            raise
+    corpo.pop("parent_id", None)
+    return await dc("POST", f"/guilds/{gid}/channels", corpo=corpo, motivo=motivo)
+
+
+async def _mandar_pagamento(canal_id: str, prod: dict, compra: dict) -> None:
+    uid = compra["comprador"]
+    pix = gerar_pix(prod.get("preco"), compra["txid"])
+    link = prod.get("link_pagamento")
+    qr_url = prod.get("qr_imagem_url")
+    passos = []
+    if pix:
+        passos.append("Escaneie o **QR Code** abaixo no app do seu banco **ou** copie o código Pix da próxima "
+                      "mensagem (no celular: segure a mensagem → **Copiar texto**).")
+    elif qr_url:
+        passos.append("Escaneie o **QR Code** abaixo no app do seu banco.")
+    if link:
+        passos.append("Se preferir, pague pelo botão **💳 Pagar pelo link**." if passos else
+                      "Pague pelo botão **💳 Pagar pelo link** lá embaixo.")
+    sem_pagamento = not (pix or qr_url or link)
+    if sem_pagamento:
+        passos.append("Aguarde: a equipe vai mandar os dados de pagamento aqui neste chat.")
+    passos.append("Depois de pagar, clique em **✅ Confirmar pagamento** e digite seu **nome completo**.")
+    passos.append("A equipe confere o pagamento e o produto chega na sua **DM** automaticamente.")
+    lista = "\n".join(f"**{i}.** {p}" for i, p in enumerate(passos, 1))
+    embed: dict[str, Any] = {
+        "title": f'🛒 Compra • {prod["nome"]}',
+        "description": (f"Olá, <@{uid}>! Este chat é **privado**: só você e a equipe conseguem ver.\n\n"
+                        f'💰 **Valor:** {_reais(prod.get("preco"))}\n🧾 **Código da compra:** `{compra["txid"]}`\n\n'
+                        f"**Como pagar**\n{lista}\n\n"
+                        "⚠️ Pague **somente** pelos dados deste chat. Se o pagamento não for informado em 24 horas, "
+                        "este chat fecha sozinho."),
+        "color": prod.get("cor") or CORES["roxo"],
+        "footer": {"text": "ECO PULSE • Compra segura"},
+    }
+    mencoes: dict[str, Any] = {"parse": [], "users": [uid]}
+    conteudo = f"<@{uid}>"
+    aprov = prod.get("cargo_aprovador_id")
+    if sem_pagamento and aprov:
+        conteudo += f" <@&{aprov}>"
+        mencoes["roles"] = [aprov]
+    payload: dict[str, Any] = {"content": conteudo, "embeds": [embed], "allowed_mentions": mencoes}
+    png = _qr_png(pix) if pix else None
+    if png:
+        embed["image"] = {"url": "attachment://pix.png"}
+        payload["attachments"] = [{"id": 0, "filename": "pix.png"}]
+        await dc("POST", f"/channels/{canal_id}/messages", dados={"payload_json": json.dumps(payload)},
+                 arquivos={"files[0]": ("pix.png", png, "image/png")})
+    else:
+        if pix:
+            embed["image"] = {"url": _qr_url_online(pix)}
+        elif qr_url:
+            embed["image"] = {"url": qr_url}
+        await dc("POST", f"/channels/{canal_id}/messages", corpo=payload)
+    botoes = [_botao("Confirmar pagamento", "ecop:pago", 3, "✅")]
+    if link:
+        botoes.append({"type": 2, "style": 5, "label": "Pagar pelo link", "url": link, "emoji": {"name": "💳"}})
+    botoes.append(_botao("Cancelar compra", "ecop:cancelar", 4, "❌"))
+    msg = await dc("POST", f"/channels/{canal_id}/messages", corpo={
+        "content": pix or "Quando terminar de pagar, clique no botão abaixo 👇",
+        "components": [_linha(*botoes)], "allowed_mentions": {"parse": []}})
+    compra["msg_botoes"] = msg["id"]
+
+
+async def _clicou_comprar(r: _Resposta, produto: str) -> None:
+    inter = r.inter
+    await r.adiar()
+    await exigir_config()
+    prod = _cfg["produtos"].get(produto)
+    if not prod or not prod.get("ativo", True):
+        await r.efemera("Este produto não está disponível no momento.")
+        return
+    uid = str(inter.user.id)
+    async with _loja_lock:
+        for canal_id, c in list(_cfg["compras"].items()):
+            if c["comprador"] == uid and c["produto"] == produto and c["status"] in STATUS_ABERTOS:
+                if await _canal_existe(canal_id):
+                    await r.efemera(f"Você já tem uma compra aberta deste produto: <#{canal_id}>")
+                    return
+                _cfg["compras"].pop(canal_id, None)
+        nome = getattr(inter.user, "display_name", None) or inter.user.name
+        canal = await _criar_canal_compra(prod, uid, nome, inter.user.name)
+        agora = _agora()
+        compra: dict[str, Any] = {
+            "produto": produto, "comprador": uid, "comprador_nome": nome, "status": "aguardando",
+            "valor": prod.get("preco"), "txid": "ECOP" + secrets.token_hex(4).upper(),
+            "criado": agora.isoformat(), "fechar_em": (agora + ESPERA_PAGAMENTO).isoformat(),
+        }
+        _cfg["compras"][canal["id"]] = compra
+    try:
+        await _mandar_pagamento(canal["id"], prod, compra)
+    finally:
+        await salvar_config()
+    await r.efemera(f'✅ Seu chat de compra foi criado: <#{canal["id"]}>\nO pagamento por Pix já está lá.')
+    await registrar(f'🛒 <@{uid}> abriu uma compra de **{prod["nome"]}** em <#{canal["id"]}>.')
+
+
+async def _clicou_pago(r: _Resposta) -> None:
+    inter = r.inter
+    if not _cfg_estado["carregada"]:
+        asyncio.create_task(garantir_config())
+        await r.efemera("O bot acabou de reiniciar. Tente de novo em alguns segundos.")
+        return
+    c = _cfg["compras"].get(str(inter.channel_id))
+    if not c:
+        await r.efemera("Esta compra já foi encerrada.")
+        return
+    if str(inter.user.id) != c["comprador"]:
+        await r.efemera("Só quem está comprando pode confirmar o pagamento.")
+        return
+    if c["status"] != "aguardando":
+        await r.efemera("Você já informou o pagamento. Agora é só aguardar a equipe conferir.")
+        return
+    await r.enviar(9, {
+        "custom_id": "ecop:modal_pago", "title": "Confirmar pagamento",
+        "components": [_linha({"type": 4, "custom_id": "nome", "style": 1, "label": "Seu nome completo",
+                               "placeholder": "Ex.: Maria da Silva Souza", "min_length": 5, "max_length": 100,
+                               "required": True})],
+    })
+
+
+async def _modal_pago(r: _Resposta) -> None:
+    inter = r.inter
+    canal = str(inter.channel_id)
+    c = _cfg["compras"].get(canal)
+    if not c or str(inter.user.id) != c["comprador"]:
+        await r.efemera("Esta compra já foi encerrada.")
+        return
+    if c["status"] != "aguardando":
+        await r.efemera("Você já informou o pagamento. Agora é só aguardar a equipe conferir.")
+        return
+    nome = re.sub(r"[`*_~|<>@#\\]", "", _valor_modal(inter.data, "nome") or "")
+    nome = re.sub(r"\s+", " ", nome).strip()
+    if len(nome) < 5 or len(nome.split()) < 2:
+        await r.efemera("Digite seu **nome completo** (nome e sobrenome). Clique em ✅ Confirmar pagamento de novo.")
+        return
+    prod = _cfg["produtos"].get(c["produto"], {})
+    c.update(status="analise", nome_completo=nome, informado=_agora().isoformat(), fechar_em=None)
+    aprov = prod.get("cargo_aprovador_id")
+    embed = {
+        "title": "🧾 Pagamento informado",
+        "description": (f'<@{c["comprador"]}> disse que já pagou **{prod.get("nome", c["produto"])}**.\n\n'
+                        f"👤 **Nome completo:** {nome}\n💰 **Valor:** {_reais(c.get('valor'))}\n"
+                        f'🧾 **Código da compra:** `{c["txid"]}`\n\n'
+                        "Confira no extrato do banco e escolha abaixo.\n"
+                        f'<@{c["comprador"]}>, agora é só aguardar a equipe conferir. 🙏'),
+        "color": CORES["amarelo"],
+        "footer": {"text": f'Só o cargo {prod.get("cargo_aprovador_nome") or "Fundador"} pode confirmar ou recusar'},
+    }
+    dados: dict[str, Any] = {"embeds": [embed], "components": [_botoes_decisao()],
+                             "allowed_mentions": {"parse": [], "roles": [aprov] if aprov else []}}
+    if aprov:
+        dados["content"] = f"<@&{aprov}>"
+    await r.enviar(4, dados)
+    await salvar_config()
+
+
+async def _pegar_item(prod: dict) -> tuple[str | None, tuple[str, str] | None]:
+    """Pega o próximo produto do estoque (mensagem mais antiga do canal; fixadas são ignoradas)."""
+    canal = prod.get("canal_estoque_id")
+    if canal:
+        msgs = await dc("GET", f"/channels/{canal}/messages", params={"limit": 100})
+        validas = [m for m in msgs if not m.get("pinned") and (m.get("content") or m.get("attachments"))]
+        if validas:
+            m = validas[-1]  # a API devolve da mais nova para a mais antiga
+            partes = [m.get("content") or ""] + [a["url"] for a in m.get("attachments", [])]
+            return "\n".join(p for p in partes if p).strip(), (canal, m["id"])
+    if prod.get("entrega_texto"):
+        return prod["entrega_texto"], None
+    return None, None
+
+
+async def _contar_estoque(prod: dict) -> str:
+    try:
+        msgs = await dc("GET", f'/channels/{prod["canal_estoque_id"]}/messages', params={"limit": 100})
+    except ErroDiscord as erro:
+        return f"erro: {erro}"
+    n = len([m for m in msgs if not m.get("pinned") and (m.get("content") or m.get("attachments"))])
+    return "100 ou mais" if n >= 100 else str(n)
+
+
+async def _entregar_dm(c: dict, prod: dict, item: str) -> bool:
+    try:
+        dm = await dc("POST", "/users/@me/channels", corpo={"recipient_id": c["comprador"]})
+        await dc("POST", f'/channels/{dm["id"]}/messages', corpo={"embeds": [{
+            "title": "✅ Compra confirmada!",
+            "description": (f'Seu pagamento de **{prod["nome"]}** foi confirmado. Seu produto está logo abaixo 👇\n\n'
+                            f'Guarde esta mensagem. Código da compra: `{c["txid"]}`'),
+            "color": CORES["verde"], "footer": {"text": "ECO PULSE • Obrigado pela compra!"}}]})
+        for parte in _partes(item):
+            await dc("POST", f'/channels/{dm["id"]}/messages', corpo={"content": parte, "allowed_mentions": {"parse": []}})
+        return True
+    except ErroDiscord as erro:
+        log.warning("Não consegui entregar por DM para %s: %s", c["comprador"], erro)
+        return False
+
+
+async def _aprovar(r: _Resposta, canal: str, c: dict, prod: dict, quem: str, embed: dict) -> None:
+    nome_quem = getattr(r.inter.user, "display_name", None) or r.inter.user.name
+    async with _estoque_lock:
+        item, origem = await _pegar_item(prod)
+        if item is None:
+            c["status"] = "analise"
+            await r.editar_original({"embeds": [_com_rodape(embed, "⚠️ Sem produto para entregar: abasteça e clique em Confirmar de novo")],
+                                     "components": [_botoes_decisao()]})
+            onde = (f'Mande o produto em <#{prod["canal_estoque_id"]}> (1 mensagem = 1 entrega)'
+                    if prod.get("canal_estoque_id") else "Configure a entrega do produto")
+            await dc("POST", f"/channels/{canal}/messages", corpo={
+                "content": (f"⚠️ <@{quem}>, acabou o estoque de **{prod['nome']}**. {onde} e clique em **✅ Confirmar** de novo.\n"
+                            f'<@{c["comprador"]}>, seu pagamento já foi visto. Só aguarde um pouquinho.'),
+                "allowed_mentions": {"parse": [], "users": [quem, c["comprador"]]}})
+            return
+        na_dm = await _entregar_dm(c, prod, item)
+        if not na_dm:
+            await dc("POST", f"/channels/{canal}/messages", corpo={"embeds": [{
+                "title": "📦 Seu produto", "color": CORES["verde"],
+                "description": "Não consegui te mandar DM (ela está fechada), então o produto vai aqui embaixo. "
+                               "Copie e guarde antes de fechar o chat."}]})
+            for parte in _partes(item):
+                await dc("POST", f"/channels/{canal}/messages", corpo={"content": parte, "allowed_mentions": {"parse": []}})
+        if origem:
+            try:
+                await dc("DELETE", f"/channels/{origem[0]}/messages/{origem[1]}", motivo="Produto entregue")
+            except ErroDiscord as erro:
+                log.warning("Não consegui tirar o item entregue do estoque: %s", erro)
+    agora = _agora()
+    c.update(status="entregue", aprovado_por=quem, entregue=agora.isoformat())
+    if prod.get("cargo_cliente_id"):
+        try:
+            await dc("PUT", f'/guilds/{await servidor_id()}/members/{c["comprador"]}/roles/{prod["cargo_cliente_id"]}',
+                     motivo=f'Comprou {prod["nome"]}')
+        except ErroDiscord as erro:
+            log.warning("Não consegui dar o cargo de cliente: %s", erro)
+    if na_dm:
+        c["fechar_em"] = (agora + FECHAR_APOS_ENTREGA).isoformat()
+        texto = (f'<@{c["comprador"]}> ✅ Pagamento confirmado! Seu produto foi enviado na sua **DM**. '
+                 "Este chat fecha sozinho em 5 minutos.")
+        componentes: list[dict] = []
+    else:
+        c["fechar_em"] = (agora + ESPERA_PAGAMENTO).isoformat()
+        texto = (f'<@{c["comprador"]}> ✅ Pagamento confirmado! O produto está **logo acima**. '
+                 "Depois de copiar, clique em **Fechar chat**.")
+        componentes = [_linha(_botao("Fechar chat", "ecop:fechar", 2, "🔒"))]
+    await dc("POST", f"/channels/{canal}/messages", corpo={"content": texto, "components": componentes,
+                                                           "allowed_mentions": {"parse": [], "users": [c["comprador"]]}})
+    await r.editar_original({"embeds": [_com_rodape(embed, f'✅ Confirmado por {nome_quem} • entregue {"na DM" if na_dm else "no chat"}',
+                                                    CORES["verde"])], "components": []})
+    await _registrar_venda(prod, (f'🧾 **Venda confirmada** — {prod["nome"]} • {_reais(c.get("valor"))}\n'
+                                  f'Comprador: <@{c["comprador"]}> ({c.get("nome_completo")}) • Código `{c["txid"]}` • '
+                                  f"Confirmado por <@{quem}> • entregue {'na DM' if na_dm else 'no chat'} • {_fmt(agora)}"))
+    await salvar_config()
+
+
+async def _decidir(r: _Resposta, aprovar: bool) -> None:
+    inter = r.inter
+    canal = str(inter.channel_id)
+    c = _cfg["compras"].get(canal)
+    if not c:
+        await r.efemera("Esta compra já foi encerrada.")
+        return
+    prod = _cfg["produtos"].get(c["produto"], {"nome": c["produto"]})
+    if not _pode_aprovar(inter, prod):
+        await r.efemera(f'Só quem tem o cargo {prod.get("cargo_aprovador_nome") or "Fundador"} pode confirmar ou recusar.')
+        return
+    if c["status"] != "analise":
+        await r.efemera("Essa compra já foi decidida.")
+        return
+    quem = str(inter.user.id)
+    nome_quem = getattr(inter.user, "display_name", None) or inter.user.name
+    embed = _embed_da_mensagem(inter)
+    if aprovar:
+        c["status"] = "entregando"   # trava na hora: dois cliques ao mesmo tempo não entregam duas vezes
+        await r.enviar(7, {"embeds": [_com_rodape(embed, f"⏳ Confirmando… ({nome_quem})")], "components": []})
+        try:
+            await _aprovar(r, canal, c, prod, quem, embed)
+        except Exception:
+            if c.get("status") == "entregando":
+                c["status"] = "analise"
+                try:
+                    await r.editar_original({"embeds": [_com_rodape(embed, "⚠️ Deu erro na entrega. Tente Confirmar de novo.")],
+                                             "components": [_botoes_decisao()]})
+                except Exception:
+                    pass
+            raise
+        return
+    agora = _agora()
+    c.update(status="recusado", recusado_por=quem, fechar_em=(agora + FECHAR_APOS_RECUSA).isoformat())
+    await r.enviar(7, {"embeds": [_com_rodape(embed, f"❌ Recusado por {nome_quem}", CORES["vermelho"])], "components": []})
+    await dc("POST", f"/channels/{canal}/messages", corpo={
+        "content": (f'<@{c["comprador"]}> ❌ A equipe **não confirmou** o seu pagamento. Este chat fecha em 1 minuto.\n'
+                    "Se você pagou de verdade, fale com a equipe e mande o comprovante."),
+        "allowed_mentions": {"parse": [], "users": [c["comprador"]]}})
+    try:
+        dm = await dc("POST", "/users/@me/channels", corpo={"recipient_id": c["comprador"]})
+        await dc("POST", f'/channels/{dm["id"]}/messages', corpo={"embeds": [{
+            "title": "❌ Pagamento não confirmado", "color": CORES["vermelho"],
+            "description": (f'Seu pagamento de **{prod["nome"]}** não foi confirmado e o chat de compra foi fechado.\n'
+                            f'Se você pagou de verdade, fale com a equipe do servidor e mande o comprovante. '
+                            f'Código da compra: `{c["txid"]}`')}]})
+    except ErroDiscord:
+        pass
+    await _registrar_venda(prod, (f'❌ **Pagamento recusado** — {prod["nome"]} • {_reais(c.get("valor"))}\n'
+                                  f'Comprador: <@{c["comprador"]}> ({c.get("nome_completo")}) • Código `{c["txid"]}` • '
+                                  f"Recusado por <@{quem}> • {_fmt(agora)}"))
+    await salvar_config()
+
+
+async def _clicou_fechar(r: _Resposta, acao: str) -> None:
+    inter = r.inter
+    if not _cfg_estado["carregada"]:
+        asyncio.create_task(garantir_config())
+        await r.efemera("O bot acabou de reiniciar. Tente de novo em alguns segundos.")
+        return
+    canal = str(inter.channel_id)
+    c = _cfg["compras"].get(canal)
+    if not c:
+        await r.efemera("Esta compra já foi encerrada.")
+        return
+    prod = _cfg["produtos"].get(c["produto"], {"nome": c["produto"]})
+    eh_comprador = str(inter.user.id) == c["comprador"]
+    eh_equipe = _pode_aprovar(inter, prod)
+    if not (eh_comprador or eh_equipe):
+        await r.efemera("Você não pode fechar este chat.")
+        return
+    agora = _agora()
+    if acao == "cancelar":
+        if c["status"] not in ("aguardando", "analise"):
+            await r.efemera("Essa compra não pode mais ser cancelada.")
+            return
+        if c["status"] == "analise" and not eh_equipe:
+            await r.efemera("Você já informou o pagamento. Agora só a equipe pode encerrar esta compra.")
+            return
+        c.update(status="cancelado", fechar_em=(agora + FECHAR_APOS_CANCELAR).isoformat())
+        await r.enviar(4, {"content": f"🗑️ Compra cancelada por <@{inter.user.id}>. Este chat fecha em alguns segundos.",
+                           "allowed_mentions": {"parse": []}})
+        await registrar(f'🗑️ Compra de **{prod["nome"]}** de <@{c["comprador"]}> cancelada por <@{inter.user.id}>.')
+    else:
+        c["fechar_em"] = (agora + timedelta(seconds=3)).isoformat()
+        await r.enviar(4, {"content": "🔒 Fechando o chat em alguns segundos…", "allowed_mentions": {"parse": []}})
+    await salvar_config()
+
+
+async def fechar_compras() -> None:
+    """Apaga os chats de compra encerrados (e os abandonados sem pagamento informado)."""
+    if not _cfg_estado["carregada"] or not _cfg.get("compras"):
+        return
+    agora = _agora()
+    mudou = False
+    for canal_id, c in list(_cfg["compras"].items()):
+        quando = c.get("fechar_em")
+        if not quando or datetime.fromisoformat(quando) > agora:
+            continue
+        try:
+            await dc("DELETE", f"/channels/{canal_id}", motivo="Compra encerrada")
+        except ErroDiscord as erro:
+            if erro.status != 404 and erro.codigo != 10003:
+                log.warning("Não consegui fechar o chat de compra %s: %s", canal_id, erro)
+                continue
+        if c["status"] == "aguardando":
+            await registrar(f'⌛ A compra de <@{c["comprador"]}> (código `{c["txid"]}`) expirou sem pagamento informado.')
+        _cfg["compras"].pop(canal_id, None)
+        mudou = True
+    if mudou:
+        await salvar_config()
+
+
+async def ao_interagir(inter: Any) -> None:
+    dados = inter.data or {}
+    cid = str(dados.get("custom_id") or "")
+    if not cid.startswith("ecop:"):
+        return
+    partes = cid.split(":")
+    acao = partes[1] if len(partes) > 1 else ""
+    r = _Resposta(inter)
+    try:
+        if inter.type == discord.InteractionType.modal_submit:
+            if acao == "modal_pago":
+                await _modal_pago(r)
+        elif acao == "comprar":
+            await _clicou_comprar(r, partes[2] if len(partes) > 2 else "")
+        elif acao == "pago":
+            await _clicou_pago(r)
+        elif acao in ("aprovar", "recusar"):
+            await _decidir(r, acao == "aprovar")
+        elif acao in ("cancelar", "fechar"):
+            await _clicou_fechar(r, acao)
+    except Exception as erro:
+        log.exception("Falha no botão %s", cid)
+        texto = str(erro) if isinstance(erro, ErroDiscord) else "Deu um erro aqui. Tente de novo ou chame a equipe."
+        try:
+            await r.efemera(f"⚠️ {texto}")
+        except Exception:
+            pass
+
+
 def _novo_cliente(privilegiadas: bool):
     intents = discord.Intents.none()
     intents.guilds = True
@@ -961,6 +1635,14 @@ def _novo_cliente(privilegiadas: bool):
     @cliente.event
     async def on_raw_reaction_remove(payload):
         await _reacao(payload, False)
+
+    @cliente.event
+    async def on_interaction(interaction):
+        if interaction.guild_id is None or (_servidor and str(interaction.guild_id) != _servidor):
+            return
+        if interaction.type not in (discord.InteractionType.component, discord.InteractionType.modal_submit):
+            return
+        await ao_interagir(interaction)
 
     return cliente
 
@@ -1819,6 +2501,167 @@ async def desbanir(usuario: str) -> str:
     return f"✅ Usuário {uid} desbanido."
 
 
+# ── loja (compra em chat privado com Pix) ──
+
+def _resumo_produto(p: dict) -> dict:
+    return {
+        "id": p["id"], "nome": p.get("nome"), "preco": _reais(p.get("preco")), "ativo": p.get("ativo", True),
+        "aprovador": p.get("cargo_aprovador_nome") or "nenhum (só o dono do servidor)",
+        "cargo_cliente": p.get("cargo_cliente_nome") or "nenhum",
+        "canal_estoque": f'<#{p["canal_estoque_id"]}>' if p.get("canal_estoque_id") else "nenhum",
+        "entrega_texto": "configurado" if p.get("entrega_texto") else "nenhum",
+        "link_pagamento": p.get("link_pagamento") or "nenhum",
+        "qr_imagem_url": p.get("qr_imagem_url") or "nenhum",
+        "nome_do_chat": f'{p.get("prefixo_canal") or "compra-" + p["id"]}-nome-da-pessoa',
+        "categoria_dos_chats": f'<#{p["categoria_id"]}>' if p.get("categoria_id") else "nenhuma (topo do servidor)",
+        "canal_vendas": f'<#{p["canal_vendas_id"]}>' if p.get("canal_vendas_id") else "nenhum",
+        "painel": p.get("painel") or "não publicado",
+    }
+
+
+@mcp.tool()
+async def configurar_produto(produto: str, nome: str | None = None, preco: str | None = None,
+                             cargo_cliente: str | None = None, canal_estoque: str | None = None,
+                             entrega_texto: str | None = None, link_pagamento: str | None = None,
+                             qr_imagem_url: str | None = None, prefixo_canal: str | None = None,
+                             categoria: str | None = None, cargo_aprovador: str | None = None,
+                             canal_vendas: str | None = None, cor: str | None = None,
+                             ativo: bool | None = None) -> dict:
+    """Cria ou atualiza um produto da loja (compra em chat privado com Pix).
+    produto = identificador curto (ex.: chatgpt-astra). preco em reais (ex.: "19,90").
+    Pagamento: o QR Code e o "copia e cola" saem da variável PIX_CHAVE do Render com o valor do produto;
+    link_pagamento (botão) e qr_imagem_url (imagem pronta) são opcionais.
+    Entrega automática: canal_estoque (cada mensagem nele = 1 produto, entregue por DM e apagada na venda;
+    mensagens fixadas são ignoradas) ou, sem estoque, entrega_texto (o mesmo texto para todos).
+    cargo_aprovador (padrão: Fundador) confirma ou recusa os pagamentos e vê os chats. cargo_cliente é dado
+    ao comprador. prefixo_canal define o nome do chat: prefixo-nome-da-pessoa. categoria (padrão: a de
+    tickets) e canal_vendas (padrão: registro-de-vendas). Passe "" para limpar um campo."""
+    await exigir_config()
+    pid = _slug(produto, 40)
+    if not pid:
+        raise ErroDiscord("Dê um identificador para o produto, por exemplo chatgpt-astra.")
+    produtos = _cfg.setdefault("produtos", {})
+    novo = pid not in produtos
+    p = produtos.setdefault(pid, {"id": pid, "nome": (nome or produto).strip(), "ativo": True,
+                                  "criado": _agora().isoformat()})
+    if nome is not None:
+        p["nome"] = nome.strip() or pid
+    if preco is not None:
+        p["preco"] = _ler_preco(preco) if str(preco).strip() else None
+    if cor is not None:
+        p["cor"] = _cor(cor) if cor else None
+    if ativo is not None:
+        p["ativo"] = bool(ativo)
+    if prefixo_canal is not None:
+        p["prefixo_canal"] = prefixo_canal.strip()[:60] or None
+    if entrega_texto is not None:
+        p["entrega_texto"] = entrega_texto or None
+    for campo, valor in (("link_pagamento", link_pagamento), ("qr_imagem_url", qr_imagem_url)):
+        if valor is not None:
+            if valor and not re.match(r"https?://", valor):
+                raise ErroDiscord(f"{campo} precisa começar com https://")
+            p[campo] = valor or None
+
+    async def _guardar(ref: str | None, chave: str, achar) -> None:
+        if ref is None:
+            return
+        if not str(ref).strip():
+            p.pop(f"{chave}_id", None)
+            p.pop(f"{chave}_nome", None)
+            return
+        item = await achar(ref)
+        p[f"{chave}_id"], p[f"{chave}_nome"] = item["id"], item["name"]
+
+    await _guardar(cargo_cliente, "cargo_cliente", achar_cargo)
+    await _guardar(cargo_aprovador, "cargo_aprovador", achar_cargo)
+    await _guardar(canal_estoque, "canal_estoque", lambda ref: achar_canal(ref, tipos={0}))
+    await _guardar(categoria, "categoria", achar_categoria)
+    await _guardar(canal_vendas, "canal_vendas", lambda ref: achar_canal(ref, tipos={0}))
+    if novo:  # padrões do ECO PULSE
+        if cargo_aprovador is None:
+            try:
+                cg = next(c for c in await _cargos() if _norm(c["name"]) == "fundador")
+                p["cargo_aprovador_id"], p["cargo_aprovador_nome"] = cg["id"], cg["name"]
+            except StopIteration:
+                pass
+        canais = await _canais()
+        if categoria is None:
+            cat = next((c for c in canais if c["type"] == 4 and "ticket" in _norm(c["name"])), None)
+            if cat:
+                p["categoria_id"], p["categoria_nome"] = cat["id"], cat["name"]
+        if canal_vendas is None:
+            cv = next((c for c in canais if c["type"] == 0 and "registrodevendas" in _norm(c["name"])), None)
+            if cv:
+                p["canal_vendas_id"], p["canal_vendas_nome"] = cv["id"], cv["name"]
+    await salvar_config()
+    avisos = []
+    if not (PIX_CHAVE or PIX_COPIA_COLA or p.get("link_pagamento") or p.get("qr_imagem_url")):
+        avisos.append("Sem dados de pagamento: o dono precisa criar a variável PIX_CHAVE no Render "
+                      "(ou passar link_pagamento / qr_imagem_url). Sem isso o chat pede para a equipe mandar os dados.")
+    if PIX_COPIA_COLA and not PIX_CHAVE and p.get("preco"):
+        avisos.append("PIX_COPIA_COLA é um código fixo: o valor dele não muda com o preço do produto.")
+    if not p.get("canal_estoque_id") and not p.get("entrega_texto"):
+        avisos.append("Sem entrega automática: configure canal_estoque ou entrega_texto.")
+    if not p.get("cargo_aprovador_id"):
+        avisos.append("Sem cargo aprovador: só o dono do servidor consegue confirmar pagamentos.")
+    if not p.get("preco"):
+        avisos.append("Sem preço: o Pix sai sem valor (a pessoa digita o valor no banco).")
+    return {"ok": True, "novo": novo, "produto": _resumo_produto(p), "avisos": avisos}
+
+
+@mcp.tool()
+async def publicar_painel_compra(canal_id: str, produto: str, mensagem_id: str | None = None,
+                                 titulo: str | None = None, descricao: str | None = None, cor: str | None = None,
+                                 imagem_url: str | None = None, miniatura_url: str | None = None,
+                                 rodape: str | None = None, botao_texto: str = "Comprar agora") -> dict:
+    """Publica o painel de venda de um produto com o botão que abre o chat privado de compra.
+    Com mensagem_id, troca os botões de uma mensagem já enviada pelo bot (e o texto, se passar
+    titulo/descricao) em vez de mandar outra."""
+    await exigir_config()
+    pid = _slug(produto, 40)
+    prod = _cfg["produtos"].get(pid)
+    if not prod:
+        raise ErroDiscord(f'O produto "{produto}" não existe. Crie antes com configurar_produto.')
+    canal = await achar_canal(canal_id)
+    botoes = {"type": 1, "components": [{**_botao(botao_texto, f"ecop:comprar:{pid}", 3), "emoji": {"name": "🛒"}}]}
+    tem_texto = any([titulo, descricao, imagem_url, miniatura_url, rodape])
+    if mensagem_id and not tem_texto:
+        payload: dict[str, Any] = {"components": [botoes]}
+    else:
+        payload = montar_mensagem(
+            titulo=titulo or f'💎 {prod["nome"]}',
+            descricao=descricao or (f'💰 **Valor:** {_reais(prod.get("preco"))}\n\n'
+                                    "Clique em **Comprar agora** e um chat privado será criado só para você, "
+                                    "com o QR Code do Pix. Pagou? Clique em **Confirmar pagamento**, informe seu "
+                                    "nome completo e o produto chega na sua DM assim que a equipe confirmar."),
+            cor=cor, imagem_url=imagem_url, miniatura_url=miniatura_url, rodape=rodape or "ECO PULSE • Compra segura")
+        payload["components"] = [botoes]
+    if mensagem_id:
+        msg = await dc("PATCH", f'/channels/{canal["id"]}/messages/{mensagem_id}', corpo=payload)
+    else:
+        msg = await dc("POST", f'/channels/{canal["id"]}/messages', corpo=payload)
+    prod["painel"] = {"canal_id": canal["id"], "mensagem_id": msg["id"]}
+    await salvar_config()
+    return {"ok": True, "mensagem_id": msg["id"], "link": _link_canal(await servidor_id(), canal["id"], msg["id"])}
+
+
+@mcp.tool(annotations=LEITURA)
+async def ver_loja() -> dict:
+    """Mostra os produtos da loja (preço, entrega, estoque, aprovador) e as compras em andamento."""
+    await exigir_config()
+    produtos = []
+    for p in _cfg.get("produtos", {}).values():
+        resumo = _resumo_produto(p)
+        if p.get("canal_estoque_id"):
+            resumo["itens_no_estoque"] = await _contar_estoque(p)
+        produtos.append(resumo)
+    compras = [{"canal": f"<#{cid}>", "canal_id": cid, "produto": c["produto"], "comprador": f'<@{c["comprador"]}>',
+                "status": c["status"], "nome_completo": c.get("nome_completo"), "codigo": c["txid"],
+                "aberta_em": _fmt(c["criado"])} for cid, c in _cfg.get("compras", {}).items()]
+    return {"pix": "configurado" if (PIX_CHAVE or PIX_COPIA_COLA) else "não configurado (variável PIX_CHAVE no Render)",
+            "produtos": produtos, "compras_em_andamento": compras}
+
+
 # ── servidor ──
 
 @mcp.tool(annotations=LEITURA)
@@ -1863,6 +2706,8 @@ async def status_agente() -> dict:
         "cargos_por_reacao": len(_cfg["cargos_reacao"]),
         "manter_acordado": bool(MANTER_ACORDADO and os.getenv("RENDER_EXTERNAL_URL")),
         "protegido_por_chave": bool(CHAVE),
+        "loja": {"pix": "configurado" if (PIX_CHAVE or PIX_COPIA_COLA) else "não configurado",
+                 "produtos": len(_cfg.get("produtos", {})), "compras_em_andamento": len(_cfg.get("compras", {}))},
     }
     if _bot_estado.get("servidores"):
         status["servidores_do_bot"] = _bot_estado["servidores"]

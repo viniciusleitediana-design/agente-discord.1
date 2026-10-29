@@ -1,3 +1,4 @@
 mcp==2.3.0
 discord.py>=2.5,<3
 tzdata
+segno
