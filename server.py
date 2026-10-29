@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "3.2"
+VERSAO = "3.3"
 INICIO = time.time()
 
 
@@ -5768,22 +5768,32 @@ async def ao_comando_vendas(r: _Resposta, nome: str, op: dict, dados: dict) -> N
             return
         jid, plano = op["jogo"], op["plano"]
         j, pr = _jogo(jid), _produto(jid, plano)
-        novas = repetidas = 0
+        novas = repetidas = reativadas = 0
         with _tx() as conn:
             for k in dict.fromkeys(keys):
                 cur = conn.execute("INSERT OR IGNORE INTO keys (jogo, plano, valor_cifrado, hash, final, adicionada_por, adicionada_em) "
                                    "VALUES (?, ?, ?, ?, ?, ?, ?)", (jid, plano, cifrar(k), _hash_key(k), _mascarar(k), quem, _agora_iso()))
                 if cur.rowcount:
                     novas += 1
+                    continue
+                # key revogada que nunca foi entregue pode voltar ao estoque (ex.: tinha entrado no plano errado)
+                volta = conn.execute("UPDATE keys SET jogo = ?, plano = ?, status = 'disponivel', pedido_id = NULL, adicionada_por = ?, "
+                                     "adicionada_em = ?, revogada_por = NULL, revogada_em = NULL, motivo_revogacao = NULL "
+                                     "WHERE hash = ? AND status = 'revogada' AND entregue_em IS NULL",
+                                     (jid, plano, quem, _agora_iso(), _hash_key(k))).rowcount
+                if volta:
+                    reativadas += 1
                 else:
                     repetidas += 1
             repetidas += len(keys) - len(dict.fromkeys(keys))
-            _auditar(conn, "keys_adicionadas", None, quem, f"{jid}/{plano}: {novas}")
+            _auditar(conn, "keys_adicionadas", None, quem, f"{jid}/{plano}: {novas} novas, {reativadas} reativadas")
         est = _estoque(jid, plano)
-        await r.efemera(f'✅ **{novas}** key(s) adicionada(s) em {_rotulo_jogo(j)} • {pr["nome"]}.'
-                        + (f"\n⚠️ {repetidas} repetida(s) ignorada(s) (já estavam no cofre)." if repetidas else "")
+        await r.efemera(f'✅ **{novas + reativadas}** key(s) adicionada(s) em {_rotulo_jogo(j)} • {pr["nome"]}.'
+                        + (f"\n♻️ {reativadas} delas estavam revogadas (sem nunca terem sido entregues) e voltaram ao estoque neste plano."
+                           if reativadas else "")
+                        + (f"\n⚠️ {repetidas} repetida(s) ignorada(s) (já estão no estoque ou já foram entregues)." if repetidas else "")
                         + f'\nEstoque agora: **{est["disponiveis"]}** no cofre • {est["livre"]} livres para novos pedidos.')
-        await registrar_venda_log(f'🔑 <@{quem}> adicionou {novas} key(s) em {_rotulo_jogo(j)} • {pr["nome"]}.')
+        await registrar_venda_log(f'🔑 <@{quem}> adicionou {novas + reativadas} key(s) em {_rotulo_jogo(j)} • {pr["nome"]}.')
         for p in _q("SELECT id FROM pedidos WHERE status = ? AND jogo = ? AND plano = ? ORDER BY aprovado_em", (AG_ESTOQUE, jid, plano)):
             asyncio.create_task(entregar_pedido(p["id"]))
         _paineis_depois(2, jogo=jid)
