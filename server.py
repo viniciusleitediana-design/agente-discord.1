@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "2.3"
+VERSAO = "2.4"
 INICIO = time.time()
 
 
@@ -592,7 +592,7 @@ def _link_canal(gid: str, cid: str, mid: str | None = None) -> str:
 
 CONFIG_PADRAO: dict[str, Any] = {"versao": 1, "agendadas": [], "boas_vindas": {}, "despedida": {},
                                  "respostas": [], "cargos_reacao": [], "logs": {},
-                                 "produtos": {}, "compras": {}, "paineis": {}, "tickets": {}, "sorteios": {}, "vendas": []}
+                                 "produtos": {}, "compras": {}, "paineis": {}, "tickets": {}, "sorteios": {}, "vendas": [], "entregas": {}}
 _cfg: dict[str, Any] = deepcopy(CONFIG_PADRAO)
 _cfg_estado: dict[str, Any] = {"carregada": False, "canal_id": None, "msg_id": None, "aviso": None, "tentativa": 0.0}
 _cfg_lock = asyncio.Lock()
@@ -814,7 +814,7 @@ async def loop_agendador() -> None:
         except Exception:
             log.exception("Erro no agendador")
         for tarefa, rotulo in ((fechar_compras, "fechar chats de compra"), (rodar_sorteios, "encerrar sorteios"),
-                               (limpar_tickets, "fechar tickets")):
+                               (limpar_tickets, "fechar tickets"), (fechar_entregas, "fechar canais de entrega")):
             try:
                 await tarefa()
             except asyncio.CancelledError:
@@ -1007,7 +1007,7 @@ def gerar_pix(valor: float | None, txid: str) -> str | None:
     if "@" in chave:
         chave = chave.lower()
     conta = _campo_emv("00", "br.gov.bcb.pix") + _campo_emv("01", chave)
-    corpo = _campo_emv("00", "01") + _campo_emv("26", conta) + _campo_emv("52", "0000") + _campo_emv("53", "986")
+    corpo = _campo_emv("00", "01") + _campo_emv("01", "11") + _campo_emv("26", conta) + _campo_emv("52", "0000") + _campo_emv("53", "986")
     if valor:
         corpo += _campo_emv("54", f"{valor:.2f}")
     corpo += _campo_emv("58", "BR") + _campo_emv("59", _ascii_pix(PIX_NOME, 25, "ECO PULSE"))
@@ -1208,7 +1208,7 @@ async def _mandar_pagamento(canal_id: str, prod: dict, compra: dict) -> None:
     if sem_pagamento:
         passos.append("Aguarde: a equipe vai mandar os dados de pagamento aqui neste chat.")
     passos.append("Depois de pagar, clique em **✅ Confirmar pagamento** e digite seu **nome completo**.")
-    passos.append("A equipe confere o pagamento e o produto chega na sua **DM** automaticamente.")
+    passos.append(f"A equipe confere o pagamento e o produto chega {_onde_entrega(prod)} automaticamente.")
     lista = "\n".join(f"**{i}.** {p}" for i, p in enumerate(passos, 1))
     embed: dict[str, Any] = {
         "title": f'🛒 Compra • {prod["nome"]}',
@@ -1382,6 +1382,142 @@ async def _entregar_dm(c: dict, prod: dict, item: str) -> bool:
         return False
 
 
+DIAS_ENTREGA_PADRAO = 7
+_MODOS_ENTREGA = {"canal": "canal", "canalprivado": "canal", "privado": "canal", "dm": "dm", "mensagemdireta": "dm",
+                  "canaledm": "canal_e_dm", "canalmaisdm": "canal_e_dm", "ambos": "canal_e_dm", "osdois": "canal_e_dm"}
+
+
+def _modo_entrega(prod: dict) -> str:
+    return prod.get("entrega_modo") or "canal"
+
+
+def _onde_entrega(prod: dict) -> str:
+    return {"canal": "num **canal privado** só seu", "dm": "na sua **DM**",
+            "canal_e_dm": "num **canal privado** só seu e na sua **DM**"}[_modo_entrega(prod)]
+
+
+async def _criar_canal_entrega(c: dict, prod: dict) -> dict:
+    gid, bot = await servidor_id(), await eu()
+    uid = c["comprador"]
+    perms: list[dict[str, Any]] = [
+        {"id": gid, "type": 0, "allow": "0", "deny": str(VER)},
+        {"id": uid, "type": 1, "allow": str(VER | HISTORICO | ENVIAR | ANEXAR), "deny": "0"},
+        {"id": bot["id"], "type": 1, "allow": str(VER | ENVIAR | HISTORICO | ANEXAR | EMBED_LINKS | GERENCIAR_MSG), "deny": "0"},
+    ]
+    if prod.get("cargo_aprovador_id"):
+        perms.append({"id": prod["cargo_aprovador_id"], "type": 0, "allow": str(VER | ENVIAR | HISTORICO | GERENCIAR_MSG), "deny": "0"})
+    nome = f'{prod.get("prefixo_entrega") or "📦・entrega"}-{_slug(c.get("comprador_nome"), 30) or uid[-6:]}'
+    dias = int(prod.get("dias_entrega") or DIAS_ENTREGA_PADRAO)
+    return await _criar_canal_privado(
+        nome, perms, prod.get("categoria_entrega_id") or prod.get("categoria_id"),
+        f'Entrega de {prod["nome"]} para <@{uid}> • código {c["txid"]} • disponível por {dias} dias',
+        f'Entrega de {prod["nome"]}')
+
+
+async def _entregar(c: dict, prod: dict, item: str) -> dict:
+    """Entrega o produto conforme o modo do produto: canal privado só do comprador (padrão), DM ou os dois.
+    Se o canal não puder ser criado, cai para a DM."""
+    modo = _modo_entrega(prod)
+    uid = c["comprador"]
+    res: dict[str, Any] = {"canal": None, "dm": False}
+    if modo in ("canal", "canal_e_dm"):
+        ch = None
+        try:
+            ch = await _criar_canal_entrega(c, prod)
+            dias = int(prod.get("dias_entrega") or DIAS_ENTREGA_PADRAO)
+            fim = _agora() + timedelta(days=dias)
+            await dc("POST", f'/channels/{ch["id"]}/messages', corpo={
+                "content": f"<@{uid}>", "allowed_mentions": {"parse": [], "users": [uid]},
+                "embeds": [{"title": f'✅ Compra confirmada • {prod["nome"]}', "color": CORES["verde"],
+                            "description": (f"Seu pagamento foi confirmado! Seu produto está **logo abaixo** 👇\n\n"
+                                            f'🧾 **Código da compra:** `{c["txid"]}`\n'
+                                            f"⚠️ **Copie e guarde o conteúdo:** este canal é apagado <t:{int(fim.timestamp())}:R> "
+                                            f"(<t:{int(fim.timestamp())}:f>)."),
+                            "footer": {"text": "ECO PULSE • Obrigado pela compra! Este canal é só seu."}}]})
+            for parte in _partes(item):
+                await dc("POST", f'/channels/{ch["id"]}/messages', corpo={"content": parte, "allowed_mentions": {"parse": []}})
+            await dc("POST", f'/channels/{ch["id"]}/messages', corpo={
+                "content": "Já copiou e guardou tudo? Pode fechar este canal quando quiser.",
+                "components": [_linha(_botao("Já salvei, fechar canal", "ecop:fechar_entrega", 2, "🔒"))]})
+            _cfg.setdefault("entregas", {})[ch["id"]] = {
+                "comprador": uid, "produto": c["produto"], "txid": c["txid"],
+                "criado": _agora().isoformat(), "fechar_em": fim.isoformat()}
+            res["canal"] = ch["id"]
+        except ErroDiscord as erro:
+            log.warning("Não consegui entregar no canal privado (%s); tentando a DM.", erro)
+            if ch:
+                try:
+                    await dc("DELETE", f'/channels/{ch["id"]}', motivo="Entrega falhou")
+                except ErroDiscord:
+                    pass
+    if modo in ("dm", "canal_e_dm") or not res["canal"]:
+        res["dm"] = await _entregar_dm(c, prod, item)
+    else:
+        try:  # só um aviso na DM, sem o conteúdo
+            dm = await dc("POST", "/users/@me/channels", corpo={"recipient_id": uid})
+            await dc("POST", f'/channels/{dm["id"]}/messages', corpo={"embeds": [{
+                "title": "✅ Compra confirmada!", "color": CORES["verde"],
+                "description": f'Seu pagamento de **{prod["nome"]}** foi confirmado. Seu produto está no canal privado <#{res["canal"]}>.'}]})
+        except ErroDiscord:
+            pass
+    return res
+
+
+async def _clicou_fechar_entrega(r: _Resposta, confirmado: bool) -> None:
+    inter = r.inter
+    if not _cfg_estado["carregada"]:
+        asyncio.create_task(garantir_config())
+        await r.efemera("O bot acabou de reiniciar. Tente de novo em alguns segundos.")
+        return
+    canal = str(inter.channel_id)
+    e = _cfg.get("entregas", {}).get(canal)
+    if not e:
+        await r.efemera("Este canal já está sendo fechado.")
+        return
+    prod = _cfg.get("produtos", {}).get(e["produto"], {})
+    if str(inter.user.id) != e["comprador"] and not _pode_aprovar(inter, prod):
+        await r.efemera("Só quem comprou pode fechar este canal.")
+        return
+    if not confirmado:
+        await r.enviar(4, {"content": "Tem certeza? Depois de fechar, o conteúdo some. Confira se você copiou e guardou tudo.",
+                           "flags": 64, "components": [_linha(_botao("Sim, fechar", "ecop:fechar_entrega_ok", 4, "🔒"))]})
+        return
+    e["fechar_em"] = (_agora() + timedelta(seconds=3)).isoformat()
+    await r.enviar(7, {"content": "🔒 Fechando o canal…", "components": []})
+    await salvar_config()
+
+
+async def fechar_entregas() -> None:
+    """Apaga canais de entrega vencidos (avisa o comprador 1 dia antes)."""
+    if not _cfg_estado["carregada"] or not _cfg.get("entregas"):
+        return
+    agora = _agora()
+    mudou = False
+    for canal_id, e in list(_cfg["entregas"].items()):
+        fim = datetime.fromisoformat(e["fechar_em"])
+        if fim <= agora:
+            try:
+                await dc("DELETE", f"/channels/{canal_id}", motivo="Entrega encerrada")
+            except ErroDiscord as erro:
+                if erro.status != 404 and erro.codigo != 10003:
+                    log.warning("Não consegui apagar o canal de entrega %s: %s", canal_id, erro)
+                    continue
+            _cfg["entregas"].pop(canal_id, None)
+            mudou = True
+        elif not e.get("avisado") and fim - agora <= timedelta(hours=24) and fim - datetime.fromisoformat(e["criado"]) > timedelta(hours=25):
+            e["avisado"] = True
+            mudou = True
+            try:
+                await dc("POST", f"/channels/{canal_id}/messages", corpo={
+                    "content": f'⏰ <@{e["comprador"]}>, este canal será apagado <t:{int(fim.timestamp())}:R>. Copie e guarde o seu produto!',
+                    "allowed_mentions": {"parse": [], "users": [e["comprador"]]}})
+            except ErroDiscord as erro:
+                if erro.status == 404 or erro.codigo == 10003:
+                    _cfg["entregas"].pop(canal_id, None)
+    if mudou:
+        await salvar_config()
+
+
 async def _aprovar(r: _Resposta, canal: str, c: dict, prod: dict, quem: str, embed: dict) -> None:
     nome_quem = getattr(r.inter.user, "display_name", None) or r.inter.user.name
     async with _estoque_lock:
@@ -1397,8 +1533,9 @@ async def _aprovar(r: _Resposta, canal: str, c: dict, prod: dict, quem: str, emb
                             f'<@{c["comprador"]}>, seu pagamento já foi visto. Só aguarde um pouquinho.'),
                 "allowed_mentions": {"parse": [], "users": [quem, c["comprador"]]}})
             return
-        na_dm = await _entregar_dm(c, prod, item)
-        if not na_dm:
+        entrega = await _entregar(c, prod, item)
+        na_dm = entrega["dm"]
+        if not entrega["canal"] and not na_dm:
             await dc("POST", f"/channels/{canal}/messages", corpo={"embeds": [{
                 "title": "📦 Seu produto", "color": CORES["verde"],
                 "description": "Não consegui te mandar DM (ela está fechada), então o produto vai aqui embaixo. "
@@ -1423,23 +1560,32 @@ async def _aprovar(r: _Resposta, canal: str, c: dict, prod: dict, quem: str, emb
                      motivo=f'Comprou {prod["nome"]}')
         except ErroDiscord as erro:
             log.warning("Não consegui dar o cargo de cliente: %s", erro)
-    if na_dm:
+    if entrega["canal"]:
+        c["fechar_em"] = (agora + FECHAR_APOS_ENTREGA).isoformat()
+        c["canal_entrega"] = entrega["canal"]
+        texto = (f'<@{c["comprador"]}> ✅ Pagamento confirmado! Seu produto está no canal privado <#{entrega["canal"]}>'
+                 + (" e na sua **DM**" if na_dm else "") + ". Este chat fecha sozinho em 5 minutos.")
+        componentes: list[dict] = []
+        onde_curto, onde = "num canal privado", f'no canal <#{entrega["canal"]}>'
+    elif na_dm:
         c["fechar_em"] = (agora + FECHAR_APOS_ENTREGA).isoformat()
         texto = (f'<@{c["comprador"]}> ✅ Pagamento confirmado! Seu produto foi enviado na sua **DM**. '
                  "Este chat fecha sozinho em 5 minutos.")
-        componentes: list[dict] = []
+        componentes = []
+        onde_curto = onde = "na DM"
     else:
+        onde_curto = onde = "no chat"
         c["fechar_em"] = (agora + ESPERA_PAGAMENTO).isoformat()
         texto = (f'<@{c["comprador"]}> ✅ Pagamento confirmado! O produto está **logo acima**. '
                  "Depois de copiar, clique em **Fechar chat**.")
         componentes = [_linha(_botao("Fechar chat", "ecop:fechar", 2, "🔒"))]
     await dc("POST", f"/channels/{canal}/messages", corpo={"content": texto, "components": componentes,
                                                            "allowed_mentions": {"parse": [], "users": [c["comprador"]]}})
-    await r.editar_original({"embeds": [_com_rodape(embed, f'✅ Confirmado por {nome_quem} • entregue {"na DM" if na_dm else "no chat"}',
+    await r.editar_original({"embeds": [_com_rodape(embed, f"✅ Confirmado por {nome_quem} • entregue {onde_curto}",
                                                     CORES["verde"])], "components": []})
     await _registrar_venda(prod, (f'🧾 **Venda confirmada** — {prod["nome"]} • {_reais(c.get("valor"))}\n'
                                   f'Comprador: <@{c["comprador"]}> ({c.get("nome_completo")}) • Código `{c["txid"]}` • '
-                                  f"Confirmado por <@{quem}> • entregue {'na DM' if na_dm else 'no chat'} • {_fmt(agora)}"))
+                                  f"Confirmado por <@{quem}> • entregue {onde} • {_fmt(agora)}"))
     await salvar_config()
 
 
@@ -2281,6 +2427,8 @@ async def _clique_loja(r: _Resposta, tipo: int, acao: str, partes: list[str]) ->
         await _decidir(r, acao == "aprovar")
     elif acao in ("cancelar", "fechar"):
         await _clicou_fechar(r, acao)
+    elif acao in ("fechar_entrega", "fechar_entrega_ok"):
+        await _clicou_fechar_entrega(r, acao == "fechar_entrega_ok")
 
 
 async def _clique_ticket(r: _Resposta, acao: str, partes: list[str], dados: dict) -> None:
@@ -2678,7 +2826,10 @@ async def ler_mensagens(canal_id: str, limite: int = 20) -> dict:
                                 "autor_id": m["author"]["id"], "quando": _fmt(m["timestamp"]),
                                 "texto": (m.get("content") or "")[:600]}
         if m.get("embeds"):
-            item["embed"] = (m["embeds"][0].get("title") or m["embeds"][0].get("description") or "")[:200]
+            e0 = m["embeds"][0]
+            item["embed"] = "\n".join(x for x in (e0.get("title"), (e0.get("description") or "")[:1500]) if x)
+        if m.get("components"):
+            item["botoes"] = [b.get("texto") or b.get("tipo") for b in _resumo_componentes(m["components"])]
         if m.get("attachments"):
             item["anexos"] = [a["filename"] for a in m["attachments"]]
         if m.get("pinned"):
@@ -3291,6 +3442,9 @@ def _resumo_produto(p: dict) -> dict:
         "cargo_cliente": p.get("cargo_cliente_nome") or "nenhum",
         "canal_estoque": f'<#{p["canal_estoque_id"]}>' if p.get("canal_estoque_id") else "nenhum",
         "entrega_texto": "configurado" if p.get("entrega_texto") else "nenhum",
+        "entrega": {"canal": f'canal privado do comprador (apagado em {p.get("dias_entrega") or DIAS_ENTREGA_PADRAO} dias)',
+                    "dm": "DM do comprador",
+                    "canal_e_dm": f'canal privado ({p.get("dias_entrega") or DIAS_ENTREGA_PADRAO} dias) + DM'}[_modo_entrega(p)],
         "link_pagamento": p.get("link_pagamento") or "nenhum",
         "qr_imagem_url": p.get("qr_imagem_url") or "nenhum",
         "nome_do_chat": f'{p.get("prefixo_canal") or "compra-" + p["id"]}-nome-da-pessoa',
@@ -3307,7 +3461,8 @@ async def configurar_produto(produto: str, nome: str | None = None, preco: str |
                              qr_imagem_url: str | None = None, prefixo_canal: str | None = None,
                              categoria: str | None = None, cargo_aprovador: str | None = None,
                              canal_vendas: str | None = None, cor: str | None = None,
-                             ativo: bool | None = None) -> dict:
+                             ativo: bool | None = None, entrega: str | None = None,
+                             dias_entrega: int | None = None, categoria_entrega: str | None = None) -> dict:
     """Cria ou atualiza um produto da loja (compra em chat privado com Pix).
     produto = identificador curto (ex.: chatgpt-astra). preco em reais (ex.: "19,90").
     Pagamento: o QR Code e o "copia e cola" saem da variável PIX_CHAVE do Render com o valor do produto;
@@ -3316,7 +3471,10 @@ async def configurar_produto(produto: str, nome: str | None = None, preco: str |
     mensagens fixadas são ignoradas) ou, sem estoque, entrega_texto (o mesmo texto para todos).
     cargo_aprovador (padrão: Fundador) confirma ou recusa os pagamentos e vê os chats. cargo_cliente é dado
     ao comprador. prefixo_canal define o nome do chat: prefixo-nome-da-pessoa. categoria (padrão: a de
-    tickets) e canal_vendas (padrão: registro-de-vendas). Passe "" para limpar um campo."""
+    tickets) e canal_vendas (padrão: registro-de-vendas). Passe "" para limpar um campo.
+    entrega = onde o produto chega quando o pagamento é confirmado: "canal" (padrão: canal privado só do
+    comprador, apagado depois de dias_entrega dias, padrão 7), "dm" ou "canal_e_dm".
+    categoria_entrega = categoria dos canais de entrega (padrão: a mesma dos chats de compra)."""
     await exigir_config()
     pid = _slug(produto, 40)
     if not pid:
@@ -3335,6 +3493,13 @@ async def configurar_produto(produto: str, nome: str | None = None, preco: str |
         p["ativo"] = bool(ativo)
     if prefixo_canal is not None:
         p["prefixo_canal"] = prefixo_canal.strip()[:60] or None
+    if entrega is not None:
+        modo = _MODOS_ENTREGA.get(_norm(entrega)) if entrega else "canal"
+        if not modo:
+            raise ErroDiscord('entrega deve ser "canal", "dm" ou "canal_e_dm".')
+        p["entrega_modo"] = modo
+    if dias_entrega is not None:
+        p["dias_entrega"] = max(1, min(60, int(dias_entrega)))
     if entrega_texto is not None:
         p["entrega_texto"] = entrega_texto or None
     for campo, valor in (("link_pagamento", link_pagamento), ("qr_imagem_url", qr_imagem_url)):
@@ -3358,6 +3523,7 @@ async def configurar_produto(produto: str, nome: str | None = None, preco: str |
     await _guardar(canal_estoque, "canal_estoque", lambda ref: achar_canal(ref, tipos={0}))
     await _guardar(categoria, "categoria", achar_categoria)
     await _guardar(canal_vendas, "canal_vendas", lambda ref: achar_canal(ref, tipos={0}))
+    await _guardar(categoria_entrega, "categoria_entrega", achar_categoria)
     if novo:  # padrões do ECO PULSE
         if cargo_aprovador is None:
             try:
@@ -3414,7 +3580,7 @@ async def publicar_painel_compra(canal_id: str, produto: str, mensagem_id: str |
             descricao=descricao or (f'💰 **Valor:** {_reais(prod.get("preco"))}\n\n'
                                     "Clique em **Comprar agora** e um chat privado será criado só para você, "
                                     "com o QR Code do Pix. Pagou? Clique em **Confirmar pagamento**, informe seu "
-                                    "nome completo e o produto chega na sua DM assim que a equipe confirmar."),
+                                    f"nome completo e o produto chega {_onde_entrega(prod)} assim que a equipe confirmar."),
             cor=cor, imagem_url=imagem_url, miniatura_url=miniatura_url, rodape=rodape or "ECO PULSE • Compra segura")
         payload["components"] = [botoes]
     msg = await _postar(canal["id"], payload, editar_id=mensagem_id)
@@ -3437,7 +3603,10 @@ async def ver_loja() -> dict:
                 "status": c["status"], "nome_completo": c.get("nome_completo"), "codigo": c["txid"],
                 "aberta_em": _fmt(c["criado"])} for cid, c in _cfg.get("compras", {}).items()]
     return {"pix": "configurado" if (PIX_CHAVE or PIX_COPIA_COLA) else "não configurado (variável PIX_CHAVE no Render)",
-            "produtos": produtos, "compras_em_andamento": compras}
+            "produtos": produtos, "compras_em_andamento": compras,
+            "canais_de_entrega": [{"canal": f"<#{cid}>", "comprador": f'<@{e["comprador"]}>', "produto": e["produto"],
+                                   "codigo": e["txid"], "apaga_em": _fmt(e["fechar_em"])}
+                                  for cid, e in _cfg.get("entregas", {}).items()]}
 
 
 @mcp.tool(annotations=LEITURA)
@@ -3772,7 +3941,8 @@ async def status_agente() -> dict:
         "manter_acordado": bool(MANTER_ACORDADO and os.getenv("RENDER_EXTERNAL_URL")),
         "protegido_por_chave": bool(CHAVE),
         "loja": {"pix": "configurado" if (PIX_CHAVE or PIX_COPIA_COLA) else "não configurado",
-                 "produtos": len(_cfg.get("produtos", {})), "compras_em_andamento": len(_cfg.get("compras", {}))},
+                 "produtos": len(_cfg.get("produtos", {})), "compras_em_andamento": len(_cfg.get("compras", {})),
+                 "canais_de_entrega": len(_cfg.get("entregas", {}))},
         "comunidade": {
             "paineis_ticket": len([p for p in _cfg.get("paineis", {}).values() if p["tipo"] == "ticket"]),
             "tickets_abertos": len(_cfg.get("tickets", {})),
