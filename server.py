@@ -261,11 +261,32 @@ def _nome_membro(m: dict) -> str:
 
 
 _servidor: str | None = GUILD_ID
+_servidor_ok = False
 _eu: dict | None = None
 
 
+async def _servidores_do_bot() -> str:
+    try:
+        lista = await dc("GET", "/users/@me/guilds")
+    except ErroDiscord:
+        return "não consegui listar"
+    return ", ".join(f'{s["name"]} (ID {s["id"]})' for s in lista) or "nenhum"
+
+
 async def servidor_id() -> str:
-    global _servidor
+    global _servidor, _servidor_ok
+    if _servidor and not _servidor_ok:
+        try:
+            await dc("GET", f"/guilds/{_servidor}")
+            _servidor_ok = True
+        except ErroDiscord as erro:
+            if erro.status in (403, 404):
+                raise ErroDiscord(
+                    f"O bot não está no servidor {_servidor} (variável GUILD_ID no Render). "
+                    f"Servidores em que ele está: {await _servidores_do_bot()}. Convide o bot para o "
+                    f"ECO PULSE (Developer Portal → OAuth2 → URL Generator → bot + Administrator) "
+                    f"ou corrija GUILD_ID.", erro.status, erro.codigo)
+            raise
     if _servidor:
         return _servidor
     servidores = await dc("GET", "/users/@me/guilds")
@@ -897,8 +918,12 @@ def _novo_cliente(privilegiadas: bool):
 
     @cliente.event
     async def on_ready():
+        servidores = ", ".join(f"{g.name} (ID {g.id})" for g in cliente.guilds) or "nenhum"
         _bot_estado["status"] = f"conectado como {cliente.user}"
-        log.info("Gateway conectado como %s", cliente.user)
+        _bot_estado["servidores"] = servidores
+        log.info("Gateway conectado como %s. Servidores do bot: %s", cliente.user, servidores)
+        if _servidor and not any(str(g.id) == _servidor for g in cliente.guilds):
+            log.warning("O bot NÃO está no servidor GUILD_ID=%s. Convide o bot para o ECO PULSE ou corrija GUILD_ID.", _servidor)
 
     @cliente.event
     async def on_member_join(member):
@@ -1839,6 +1864,8 @@ async def status_agente() -> dict:
         "manter_acordado": bool(MANTER_ACORDADO and os.getenv("RENDER_EXTERNAL_URL")),
         "protegido_por_chave": bool(CHAVE),
     }
+    if _bot_estado.get("servidores"):
+        status["servidores_do_bot"] = _bot_estado["servidores"]
     if _bot_estado.get("aviso"):
         status["aviso"] = _bot_estado["aviso"]
     try:
