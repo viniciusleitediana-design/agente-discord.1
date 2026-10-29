@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "3.3"
+VERSAO = "3.4"
 INICIO = time.time()
 
 
@@ -4761,7 +4761,15 @@ async def iniciar_vendas() -> None:
         _vendas.update(pronto=True, aviso=None, iniciado=time.time(), escritas=0)
     if not backup:
         await backup_vendas("banco criado")
+    await _limpar_keys_invalidas_seguro()
     _paineis_depois(2, criar=True)
+
+
+async def _limpar_keys_invalidas_seguro() -> None:
+    try:
+        _limpar_keys_invalidas((await eu())["id"])
+    except Exception:
+        log.exception("Vendas: falha ao conferir o estoque")
 
 
 async def _rechecar_backup() -> None:
@@ -4781,6 +4789,7 @@ async def _rechecar_backup() -> None:
     if _vendas["escritas"] == 0:
         log.info("Vendas: backup mais novo de outra instância encontrado; restaurando")
         await _restaurar(backup)
+        await _limpar_keys_invalidas_seguro()
     else:
         log.warning("Vendas: existe um backup mais novo de outra instância, mas esta já gravou dados; mantendo o atual")
 
@@ -5603,8 +5612,73 @@ def _achar_key(texto: str | None, pedido: str | None) -> sqlite3.Row | None:
     return None
 
 
-def _ler_keys(texto: str) -> list[str]:
-    return [k for k in (x.strip() for x in re.split(r"[\s,;]+", texto or "")) if 3 <= len(k) <= 300]
+_DATA_HORA = re.compile(r"^\d+(?:[/.:\-]\d+)+$")  # 29/10/2026, 23:44:07, 1.234
+_BORDAS_KEY = "`\"'“”‘’()[]{}<>*•·|"
+
+
+def _parece_key(texto: str) -> bool:
+    """Uma key tem pelo menos 6 caracteres e algum número (ou é bem longa).
+    Fica de fora o que vem junto nos arquivos .txt: títulos, palavras, rótulos ("Quantidade:"),
+    numeração ("01."), separadores ("-----", "====="), datas, horas e links."""
+    t = (texto or "").strip().strip(_BORDAS_KEY)
+    if t.endswith(":"):
+        return False
+    t = t.rstrip(".")
+    if not 6 <= len(t) <= 300 or not any(c.isalnum() for c in t):
+        return False
+    if t.lower().startswith(("http://", "https://", "www.", "discord.gg/")) or _DATA_HORA.match(t):
+        return False
+    return any(c.isdigit() for c in t) or len(t) >= 16
+
+
+def _formato_key(k: str) -> str:
+    """ECO-5127E36A-45DECC00-7F77504D-4817B526 → 3-8-8-8-8"""
+    return re.sub(r"[A-Za-z0-9]+", lambda m: str(len(m.group())), k)
+
+
+def _ler_keys(texto: str) -> tuple[list[str], int, list[str]]:
+    """Separa as keys de um texto ou arquivo. Devolve (keys, quantos trechos foram ignorados, keys fora do padrão).
+    Quando quase todas as keys têm o mesmo formato (5 ou mais, 80%+), as que fogem dele também ficam de fora
+    e são mostradas para conferência: costuma ser título ou rodapé do arquivo, não key."""
+    pedacos = [x for x in re.split(r"[\s,;]+", texto or "") if x.strip()]
+    keys = [x.strip().strip(_BORDAS_KEY).rstrip(".") for x in pedacos if _parece_key(x)]
+    ignorados = len(pedacos) - len(keys)
+    fora: list[str] = []
+    if len(keys) >= 5:
+        contagem: dict[str, int] = {}
+        for k in keys:
+            contagem[_formato_key(k)] = contagem.get(_formato_key(k), 0) + 1
+        padrao, n = max(contagem.items(), key=lambda x: x[1])
+        if n < len(keys) and n >= 0.8 * len(keys):
+            fora = [k for k in keys if _formato_key(k) != padrao]
+            keys = [k for k in keys if _formato_key(k) == padrao]
+    return keys, ignorados, fora
+
+
+def _limpar_keys_invalidas(quem: str) -> int:
+    """Revoga o que entrou no estoque sem ser key (títulos, numeração e separadores de arquivos lidos
+    antes da versão 3.4). Nunca mexe em keys entregues."""
+    if _db is None or not _vendas["pronto"]:
+        return 0
+    ruins = []
+    for k in _q("SELECT id, status, pedido_id, valor_cifrado FROM keys WHERE status IN ('disponivel', 'reservada')"):
+        valor = decifrar(k["valor_cifrado"])
+        if not valor.startswith("⚠️") and not _parece_key(valor):
+            ruins.append(k)
+    if not ruins:
+        return 0
+    with _tx() as conn:
+        for k in ruins:
+            conn.execute("UPDATE keys SET status = 'revogada', revogada_por = ?, revogada_em = ?, "
+                         "motivo_revogacao = 'não era key (título/numeração do arquivo)', "
+                         "pedido_id = CASE WHEN status = 'reservada' THEN NULL ELSE pedido_id END "
+                         "WHERE id = ? AND status IN ('disponivel', 'reservada')", (quem, _agora_iso(), k["id"]))
+            if k["status"] == "reservada" and k["pedido_id"]:
+                conn.execute("UPDATE pedidos SET key_id = NULL WHERE id = ? AND status != ?", (k["pedido_id"], ENTREGUE))
+        _auditar(conn, "keys_invalidas_revogadas", None, quem, f"{len(ruins)} itens que não eram keys")
+    log.warning("Vendas: %s itens do estoque não eram keys e foram revogados", len(ruins))
+    _paineis_depois(2)
+    return len(ruins)
 
 
 def _embed_estoque(jogo: str | None, plano: str | None) -> dict:
@@ -5759,9 +5833,10 @@ async def ao_comando_vendas(r: _Resposta, nome: str, op: dict, dados: dict) -> N
         arq = await _baixar_anexo_comando(dados, "arquivo")
         if arq:
             bruto += "\n" + arq[0].decode("utf-8", "ignore")
-        keys = _ler_keys(bruto)
+        keys, ignorados, fora = _ler_keys(bruto)
         if not keys:
-            await r.efemera("Nenhuma key encontrada. Mande em **keys** (separadas por espaço, vírgula ou linha) ou em um arquivo .txt.")
+            await r.efemera("Nenhuma key encontrada. Mande em **keys** (separadas por espaço, vírgula ou linha) ou em um arquivo .txt."
+                            + (f"\nIgnorei {ignorados} trecho(s) que não parecem key (títulos, numeração, separadores)." if ignorados else ""))
             return
         if len(keys) > 1000:
             await r.efemera("Mande no máximo 1000 keys por vez.")
@@ -5788,7 +5863,13 @@ async def ao_comando_vendas(r: _Resposta, nome: str, op: dict, dados: dict) -> N
             repetidas += len(keys) - len(dict.fromkeys(keys))
             _auditar(conn, "keys_adicionadas", None, quem, f"{jid}/{plano}: {novas} novas, {reativadas} reativadas")
         est = _estoque(jid, plano)
-        await r.efemera(f'✅ **{novas + reativadas}** key(s) adicionada(s) em {_rotulo_jogo(j)} • {pr["nome"]}.'
+        lidas = list(dict.fromkeys(keys))
+        conferir = (f"\n📄 Li **{len(lidas)}** key(s) (primeira {_mascarar(lidas[0])} • última {_mascarar(lidas[-1])})"
+                    + (f"; ignorei {ignorados} trecho(s) que não são key (títulos, numeração, separadores)." if ignorados else ".")
+                    + (f"\n🔎 {len(fora)} fora do formato das outras, **não** adicionada(s): "
+                       + ", ".join(f"`{x[:40]}`" for x in fora[:5]) + (" …" if len(fora) > 5 else "")
+                       + ". Se for key mesmo, mande sozinha em **keys**." if fora else ""))
+        await r.efemera(f'✅ **{novas + reativadas}** key(s) adicionada(s) em {_rotulo_jogo(j)} • {pr["nome"]}.' + conferir
                         + (f"\n♻️ {reativadas} delas estavam revogadas (sem nunca terem sido entregues) e voltaram ao estoque neste plano."
                            if reativadas else "")
                         + (f"\n⚠️ {repetidas} repetida(s) ignorada(s) (já estão no estoque ou já foram entregues)." if repetidas else "")
