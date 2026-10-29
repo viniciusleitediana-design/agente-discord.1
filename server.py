@@ -38,6 +38,9 @@ Comando de início no Render: python server.py
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -46,6 +49,8 @@ import os
 import random
 import re
 import secrets
+import sqlite3
+import tempfile
 import time
 import unicodedata
 from contextlib import asynccontextmanager
@@ -65,6 +70,14 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+try:  # cofre das keys e credenciais das vendas
+    from cryptography.fernet import Fernet, InvalidToken
+except Exception:  # pragma: no cover
+    Fernet = None
+
+    class InvalidToken(Exception):
+        pass
+
 try:  # o gateway (eventos em tempo real) é opcional: sem ele o resto continua funcionando
     import discord
 except Exception:  # pragma: no cover
@@ -73,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "2.5"
+VERSAO = "3.0"
 INICIO = time.time()
 
 
@@ -814,7 +827,8 @@ async def loop_agendador() -> None:
         except Exception:
             log.exception("Erro no agendador")
         for tarefa, rotulo in ((fechar_compras, "fechar chats de compra"), (rodar_sorteios, "encerrar sorteios"),
-                               (limpar_tickets, "fechar tickets"), (fechar_entregas, "fechar canais de entrega")):
+                               (limpar_tickets, "fechar tickets"), (fechar_entregas, "fechar canais de entrega"),
+                               (rodar_vendas, "cuidar das vendas")):
             try:
                 await tarefa()
             except asyncio.CancelledError:
@@ -2463,7 +2477,7 @@ async def ao_interagir(inter: Any) -> None:
     cid = str(dados.get("custom_id") or "")
     partes = cid.split(":")
     prefixo = partes[0]
-    if prefixo not in ("ecop", "ecot", "ecov", "ecos"):
+    if prefixo not in ("ecop", "ecot", "ecov", "ecos", "ecvd"):
         return
     acao = partes[1] if len(partes) > 1 else ""
     tipo = getattr(inter.type, "value", inter.type)   # 3 = botão/menu, 5 = formulário
@@ -2477,6 +2491,8 @@ async def ao_interagir(inter: Any) -> None:
             await _verificar(r, acao)
         elif prefixo == "ecos" and acao in ("entrar", "sair"):
             await _clique_sorteio(r, acao, partes[2] if len(partes) > 2 else "")
+        elif prefixo == "ecvd":
+            await ao_clique_vendas(r, tipo, partes, dados)
     except Exception as erro:
         log.exception("Falha no botão %s", cid)
         texto = str(erro) if isinstance(erro, ErroDiscord) else "Deu um erro aqui. Tente de novo ou chame a equipe."
@@ -2509,6 +2525,7 @@ def _novo_cliente(privilegiadas: bool):
         if _servidor and not any(str(g.id) == _servidor for g in cliente.guilds):
             log.warning("O bot NÃO está no servidor GUILD_ID=%s. Convide o bot para o ECO PULSE ou corrija GUILD_ID.", _servidor)
         asyncio.create_task(registrar_comandos(str(getattr(cliente, "application_id", None) or cliente.user.id)))
+        asyncio.create_task(iniciar_vendas())
 
     @cliente.event
     async def on_member_join(member):
@@ -2602,6 +2619,8 @@ mcp = MCPServer(
         "Horários são de Brasília. Antes de qualquer ação que apaga, expulsa ou bane, confirme com o usuário "
         "e só então chame de novo com confirmado=true. Em boas-vindas e respostas automáticas, os textos "
         "aceitam {usuario} (menciona a pessoa), {nome}, {servidor} e {membros}. "
+        "As vendas automáticas de keys (painéis nos 5 canais de jogo, Pix, aprovação só do FUNDADOR, entrega em canal "
+        "privado) são operadas pelos comandos de barra no Discord; vendas_status mostra a situação sem expor keys. "
         "As automações rodam no próprio bot, mesmo com o Claude fechado. Para trocar painéis de outro bot "
         "(ticket, verificação, sorteio), leia com ver_mensagem e publique de novo com copiar_de apontando para a mensagem antiga."
     ),
@@ -3966,6 +3985,7 @@ async def status_agente() -> dict:
             "sorteios_ativos": len([x for x in _cfg.get("sorteios", {}).values() if x["status"] == "ativo"])},
         "comandos_de_barra": "registrados (" + ", ".join("/" + c["name"] for c in COMANDOS) + ")" if _comandos_registrados
                              else "ainda não registrados",
+        "vendas_keys": resumo_vendas_status(),
     }
     if _bot_estado.get("servidores"):
         status["servidores_do_bot"] = _bot_estado["servidores"]
@@ -4257,9 +4277,25 @@ async def ao_comando(inter: Any, tipo: int, dados: dict) -> None:
     r = _Resposta(inter)
     try:
         if tipo == 4:
-            await _autocompletar(r, nome, dados)
+            if nome in _NOMES_VENDAS:
+                await _autocompletar_vendas(r, nome, dados)
+            else:
+                await _autocompletar(r, nome, dados)
             return
         op = _opcoes(dados)
+        if nome in _NOMES_VENDAS:
+            await ao_comando_vendas(r, nome, op, dados)
+            return
+        if nome not in ("ping", "aprovar_pagamento"):  # o /aprovar_pagamento tem a própria checagem de cargo
+            fundador_definido = _vendas["pronto"] and bool(_cfg_vendas("cargo_fundador_id"))
+            eh_fundador = fundador_definido and _eh_fundador(inter)
+            if nome in ("vendas", "pedidos_pendentes"):  # mostram valores e nomes de pagadores
+                autorizado = eh_fundador if fundador_definido else _eh_admin(inter)
+            else:
+                autorizado = eh_fundador or _eh_admin(inter)
+            if not autorizado:
+                await r.efemera("⛔ Você não tem permissão para usar este comando.")
+                return
         if nome == "ping":
             await _cmd_ping(r)
         elif nome == "vendas":
@@ -4270,7 +4306,8 @@ async def ao_comando(inter: Any, tipo: int, dados: dict) -> None:
         elif nome == "pedidos_pendentes":
             await r.adiar()
             await exigir_config()
-            await r.editar_original({"embeds": [_embed_pendentes()], "allowed_mentions": {"parse": []}})
+            embeds = ([_embed_pendentes_vendas()] if _vendas["pronto"] else []) + [_embed_pendentes()]
+            await r.editar_original({"embeds": embeds, "allowed_mentions": {"parse": []}})
             r.adiada = False
         elif nome == "aprovar_pagamento":
             await _cmd_aprovar(r, op)
@@ -4289,6 +4326,1674 @@ async def ao_comando(inter: Any, tipo: int, dados: dict) -> None:
             await r.efemera(f"⚠️ {texto}")
         except Exception:
             pass
+
+
+# ───────────────────────── VENDAS AUTOMÁTICAS ECO CHEATS (SQLite) ─────────────────────────
+#
+# Fluxo: painel com menu (1 por canal de jogo) → pedido no SQLite → canal privado de pagamento com Pix exato →
+# cliente confirma (formulário com nome do pagador) → só o cargo FUNDADOR aprova (digitando CONFIRMO) ou rejeita
+# → a key sai do estoque (cofre cifrado) para um NOVO canal privado de entrega.
+#
+# O disco do Render é apagado a cada deploy, então o banco é copiado (já cifrado nas partes sensíveis) para um
+# canal privado do servidor depois de cada alteração e restaurado automaticamente quando o bot liga.
+
+NEON = 0x39FF14
+VENDAS_DB = _env("VENDAS_DB") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "dados", "vendas.db")
+ARQ_BACKUP_VENDAS = "vendas-eco.sqlite"
+MANTER_BACKUPS = 10
+ESPERA_PAGAMENTO_VENDA = timedelta(hours=24)
+APAGAR_PAGAMENTO_APOS_ENTREGA = timedelta(minutes=30)
+APAGAR_PAGAMENTO_APOS_REJEICAO = timedelta(minutes=10)
+APAGAR_PAGAMENTO_APOS_CANCELAR = timedelta(seconds=20)
+APAGAR_PAGAMENTO_APOS_EXPIRAR = timedelta(minutes=2)
+
+# (id, nome, plataforma, emoji, canal) — os canais reais do servidor, pelos IDs
+JOGOS_PADRAO = [
+    ("cs2", "CS2", "PC", "🎯", "1563252420497379437"),
+    ("roblox-emulador", "Roblox", "Emulador", "🧱", "1563259646880514150"),
+    ("roblox-mobile", "Roblox", "Mobile", "📱", "1563640176667005028"),
+    ("free-fire-emulador", "Free Fire", "Emulador", "🔥", "1563640365561413712"),
+    ("free-fire-mobile", "Free Fire", "Mobile", "📱", "1563640449363869746"),
+]
+# (id, nome, dias (None = permanente), preço em centavos)
+PLANOS_PADRAO = [
+    ("1d", "Key 1 dia", 1, 390),
+    ("7d", "Key 7 dias", 7, 1790),
+    ("15d", "Key 15 dias", 15, 3290),
+    ("30d", "Key 30 dias", 30, 5490),
+    ("perm", "Key permanente", None, 9900),
+]
+_ORDEM_PLANOS = {p[0]: i for i, p in enumerate(PLANOS_PADRAO)}
+
+AG_PAGAMENTO, AG_CONFERENCIA = "AGUARDANDO_PAGAMENTO", "AGUARDANDO_CONFERENCIA"
+APROVADO, ENTREGANDO, AG_ESTOQUE, ENTREGUE = "APROVADO", "ENTREGANDO", "AGUARDANDO_ESTOQUE", "ENTREGUE"
+REJEITADO, CANCELADO, EXPIRADO = "REJEITADO", "CANCELADO", "EXPIRADO"
+STATUS_ABERTOS_VENDA = (AG_PAGAMENTO, AG_CONFERENCIA, APROVADO, ENTREGANDO, AG_ESTOQUE)
+ROTULO_STATUS = {
+    AG_PAGAMENTO: "⏳ Aguardando pagamento", AG_CONFERENCIA: "🔎 Aguardando conferência da equipe",
+    APROVADO: "✅ Aprovado • preparando entrega", ENTREGANDO: "📦 Entregando", AG_ESTOQUE: "⚠️ Aprovado • aguardando estoque",
+    ENTREGUE: "✅ Entregue", REJEITADO: "❌ Rejeitado", CANCELADO: "🗑️ Cancelado", EXPIRADO: "⌛ Expirado",
+}
+
+_db: sqlite3.Connection | None = None
+_vendas: dict[str, Any] = {"pronto": False, "aviso": "iniciando", "restaurado": None, "escritas": 0,
+                           "instancia": secrets.token_hex(3), "backup_msg": None, "rechecagens": 0, "iniciado": 0.0}
+_vendas_lock = asyncio.Lock()
+_locks_pedido: dict[str, asyncio.Lock] = {}
+_cliques_menu: dict[str, float] = {}
+_tarefa_backup: asyncio.Task | None = None
+_tarefa_paineis: asyncio.Task | None = None
+
+SCHEMA_VENDAS = """
+CREATE TABLE IF NOT EXISTS config (chave TEXT PRIMARY KEY, valor TEXT);
+CREATE TABLE IF NOT EXISTS jogos (
+    id TEXT PRIMARY KEY, nome TEXT NOT NULL, plataforma TEXT NOT NULL, emoji TEXT, canal_id TEXT,
+    mensagem_id TEXT, descricao TEXT, imagem_url TEXT, ordem INTEGER DEFAULT 0, ativo INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS produtos (
+    jogo TEXT NOT NULL, plano TEXT NOT NULL, nome TEXT NOT NULL, dias INTEGER, preco_centavos INTEGER NOT NULL,
+    ativo INTEGER NOT NULL DEFAULT 1, usa_keys INTEGER NOT NULL DEFAULT 1, link_pagamento TEXT, atualizado_em TEXT,
+    PRIMARY KEY (jogo, plano));
+CREATE TABLE IF NOT EXISTS keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, jogo TEXT NOT NULL, plano TEXT NOT NULL, valor_cifrado TEXT NOT NULL,
+    hash TEXT NOT NULL UNIQUE, final TEXT, status TEXT NOT NULL DEFAULT 'disponivel', pedido_id TEXT,
+    adicionada_por TEXT, adicionada_em TEXT, entregue_em TEXT, validade_dias INTEGER, expira_em TEXT,
+    revogada_por TEXT, revogada_em TEXT, motivo_revogacao TEXT);
+CREATE INDEX IF NOT EXISTS keys_estoque ON keys (jogo, plano, status);
+CREATE TABLE IF NOT EXISTS pedidos (
+    id TEXT PRIMARY KEY, usuario_id TEXT NOT NULL, usuario_nome TEXT, jogo TEXT NOT NULL, plano TEXT NOT NULL,
+    produto_nome TEXT, dias INTEGER, preco_centavos INTEGER NOT NULL, status TEXT NOT NULL,
+    canal_pagamento_id TEXT, mensagem_pedido_id TEXT, canal_entrega_id TEXT, pagador_cifrado TEXT,
+    criado_em TEXT NOT NULL, informado_em TEXT, aprovado_por TEXT, aprovado_em TEXT, rejeitado_por TEXT,
+    rejeitado_em TEXT, motivo_rejeicao TEXT, cancelado_por TEXT, entregue_em TEXT, key_id INTEGER,
+    entregando_desde TEXT, fechar_pagamento_em TEXT, pagamento_apagado INTEGER NOT NULL DEFAULT 0,
+    fechar_entrega_em TEXT, entrega_apagada INTEGER NOT NULL DEFAULT 0, link_pagamento TEXT);
+CREATE INDEX IF NOT EXISTS pedidos_status ON pedidos (status);
+CREATE INDEX IF NOT EXISTS pedidos_usuario ON pedidos (usuario_id, status);
+CREATE TABLE IF NOT EXISTS entregas_config (
+    jogo TEXT NOT NULL, plano TEXT NOT NULL, instrucoes TEXT, login_cifrado TEXT, link_download TEXT,
+    atualizado_por TEXT, atualizado_em TEXT, PRIMARY KEY (jogo, plano));
+CREATE TABLE IF NOT EXISTS auditoria (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, quando TEXT NOT NULL, pedido_id TEXT, ator_id TEXT, acao TEXT NOT NULL,
+    detalhe TEXT);
+"""
+
+
+# ── cofre: keys, logins e nomes de pagadores ficam cifrados no banco (e nos backups) ──
+
+def _chave_cofre() -> bytes:
+    bruto = _env("CHAVE_COFRE")
+    if bruto:
+        try:
+            Fernet(bruto.encode())
+            return bruto.encode()
+        except Exception:
+            pass
+    else:
+        log.warning("CHAVE_COFRE não está no Render: usando uma chave derivada do token (crie CHAVE_COFRE para não depender dele).")
+    semente = (bruto or TOKEN or "eco-cheats").encode()
+    return base64.urlsafe_b64encode(hashlib.sha256(b"eco-cofre:" + semente).digest())
+
+
+_FERNET_CACHE: list = []
+
+
+def _fernet():
+    if not _FERNET_CACHE:
+        if Fernet is None:
+            raise ErroDiscord("A biblioteca cryptography não está instalada (confira o requirements.txt).")
+        _FERNET_CACHE.append(Fernet(_chave_cofre()))
+    return _FERNET_CACHE[0]
+
+
+def cifrar(texto: str) -> str:
+    return _fernet().encrypt(texto.encode()).decode()
+
+
+def decifrar(texto: str | None) -> str:
+    if not texto:
+        return ""
+    try:
+        return _fernet().decrypt(texto.encode()).decode()
+    except InvalidToken:
+        return "⚠️ (não consegui decifrar: a CHAVE_COFRE mudou)"
+
+
+def _hash_key(valor: str) -> str:
+    return hmac.new(_chave_cofre(), b"key:" + valor.encode(), hashlib.sha256).hexdigest()
+
+
+def _mascarar(valor: str) -> str:
+    v = valor.strip()
+    return f"••••{v[-4:]}" if len(v) > 4 else "••••"
+
+
+# ── banco ──
+
+def _agora_iso() -> str:
+    return _agora().isoformat()
+
+
+def _abrir_db(caminho: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(caminho, isolation_level=None, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA_VENDAS)
+    return conn
+
+
+def _q(sql: str, args: tuple = ()) -> list[sqlite3.Row]:
+    assert _db is not None
+    return _db.execute(sql, args).fetchall()
+
+
+def _q1(sql: str, args: tuple = ()) -> sqlite3.Row | None:
+    assert _db is not None
+    return _db.execute(sql, args).fetchone()
+
+
+class _Transacao:
+    """BEGIN IMMEDIATE … COMMIT. Nenhum await dentro: o bloco inteiro roda sem ser interrompido."""
+
+    def __enter__(self) -> sqlite3.Connection:
+        assert _db is not None
+        _db.execute("BEGIN IMMEDIATE")
+        return _db
+
+    def __exit__(self, tipo, valor, tb) -> bool:
+        assert _db is not None
+        if tipo is None:
+            _db.execute("COMMIT")
+            _vendas["escritas"] += 1
+            _backup_depois()
+        else:
+            _db.execute("ROLLBACK")
+        return False
+
+
+def _tx() -> _Transacao:
+    if _db is None or not _vendas["pronto"]:
+        raise ErroDiscord("O sistema de vendas está iniciando. Tente de novo em alguns segundos.")
+    return _Transacao()
+
+
+def _auditar(conn: sqlite3.Connection, acao: str, pedido_id: str | None = None, ator: str | None = None, detalhe: str = "") -> None:
+    conn.execute("INSERT INTO auditoria (quando, pedido_id, ator_id, acao, detalhe) VALUES (?, ?, ?, ?, ?)",
+                 (_agora_iso(), pedido_id, ator, acao, detalhe[:500]))
+
+
+def _cfg_vendas(chave: str, padrao: str | None = None) -> str | None:
+    linha = _q1("SELECT valor FROM config WHERE chave = ?", (chave,))
+    return linha["valor"] if linha and linha["valor"] else padrao
+
+
+def _semear(conn: sqlite3.Connection) -> None:
+    agora = _agora_iso()
+    for i, (jid, nome, plat, emoji, canal) in enumerate(JOGOS_PADRAO):
+        conn.execute("INSERT OR IGNORE INTO jogos (id, nome, plataforma, emoji, canal_id, ordem) VALUES (?, ?, ?, ?, ?, ?)",
+                     (jid, nome, plat, emoji, canal, i))
+        for pid, pnome, dias, preco in PLANOS_PADRAO:
+            conn.execute("INSERT OR IGNORE INTO produtos (jogo, plano, nome, dias, preco_centavos, atualizado_em) "
+                         "VALUES (?, ?, ?, ?, ?, ?)", (jid, pid, pnome, dias, preco, agora))
+
+
+def _jogo(jid: str) -> sqlite3.Row:
+    j = _q1("SELECT * FROM jogos WHERE id = ?", (jid,))
+    if not j:
+        raise ErroDiscord(f'Jogo "{jid}" não existe. Use: {", ".join(x[0] for x in JOGOS_PADRAO)}.')
+    return j
+
+
+def _produto(jid: str, plano: str) -> sqlite3.Row:
+    p = _q1("SELECT * FROM produtos WHERE jogo = ? AND plano = ?", (jid, plano))
+    if not p:
+        raise ErroDiscord(f'Plano "{plano}" não existe. Use: {", ".join(x[0] for x in PLANOS_PADRAO)}.')
+    return p
+
+
+def _rotulo_jogo(j: sqlite3.Row) -> str:
+    return f'{j["nome"]} • {j["plataforma"]}'
+
+
+def _duracao(dias: int | None) -> str:
+    return "Permanente" if not dias else f'{dias} dia{"s" if dias > 1 else ""}'
+
+
+def _reais_c(centavos: int) -> str:
+    return "R$ " + f"{centavos / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _estoque(jid: str, plano: str) -> dict:
+    """Disponíveis no cofre e quanto disso já está 'prometido' para pedidos em andamento."""
+    disp = _q1("SELECT COUNT(*) n FROM keys WHERE jogo = ? AND plano = ? AND status = 'disponivel'", (jid, plano))["n"]
+    abertos = _q1(f"SELECT COUNT(*) n FROM pedidos WHERE jogo = ? AND plano = ? AND key_id IS NULL AND status IN "
+                  f"({','.join('?' * len(STATUS_ABERTOS_VENDA))})", (jid, plano, *STATUS_ABERTOS_VENDA))["n"]
+    return {"disponiveis": disp, "em_aberto": abertos, "livre": max(0, disp - abertos)}
+
+
+def _eh_fundador(inter: Any) -> bool:
+    """Só o cargo FUNDADOR (validado aqui no servidor, em toda interação)."""
+    cargo = _cfg_vendas("cargo_fundador_id")
+    return bool(cargo) and cargo in _ids_cargos(inter.user)
+
+
+def _lock_pedido(pid: str) -> asyncio.Lock:
+    if pid not in _locks_pedido:
+        _locks_pedido[pid] = asyncio.Lock()
+    return _locks_pedido[pid]
+
+
+def _novo_id_pedido() -> str:
+    while True:
+        pid = "ECO-" + secrets.token_hex(4).upper()
+        if not _q1("SELECT 1 FROM pedidos WHERE id = ?", (pid,)):
+            return pid
+
+
+# ── backup no Discord (o disco do Render não é permanente) ──
+
+async def _canal_backup_vendas() -> str:
+    salvo = _cfg_vendas("canal_backup_id") if _db is not None else None
+    if salvo:
+        return salvo
+    canais = await _canais()
+    for c in canais:
+        if c["type"] == 0 and "backup" in _norm(c["name"]):
+            return c["id"]
+    gid, bot = await servidor_id(), await eu()
+    staff = next((c for c in canais if c["type"] == 4 and "staff" in _norm(c["name"])), None)
+    corpo: dict[str, Any] = {"name": "🗄️・backups-bot", "type": 0,
+                             "topic": "Cópias automáticas do banco de vendas (dados sensíveis cifrados). Não apague.",
+                             "permission_overwrites": [{"id": gid, "type": 0, "allow": "0", "deny": str(VER)},
+                                                       {"id": bot["id"], "type": 1, "allow": str(VER | ENVIAR | ANEXAR | HISTORICO), "deny": "0"}]}
+    if staff:
+        corpo["parent_id"] = staff["id"]
+    return (await dc("POST", f"/guilds/{gid}/channels", corpo=corpo, motivo="Backups do banco de vendas"))["id"]
+
+
+def _fotografar_db() -> bytes:
+    assert _db is not None
+    with tempfile.TemporaryDirectory() as pasta:
+        destino = os.path.join(pasta, "copia.sqlite")
+        alvo = sqlite3.connect(destino)
+        _db.backup(alvo)
+        alvo.close()
+        with open(destino, "rb") as f:
+            return f.read()
+
+
+async def backup_vendas(motivo: str = "alteração") -> None:
+    if _db is None or not _vendas["pronto"]:
+        return
+    canal = await _canal_backup_vendas()
+    dados = _fotografar_db()
+    payload = {"content": f'🗄️ Banco de vendas • {_fmt(_agora())} • {motivo} • instância {_vendas["instancia"]}. Não apague.',
+               "attachments": [{"id": 0, "filename": ARQ_BACKUP_VENDAS}]}
+    msg = await dc("POST", f"/channels/{canal}/messages", dados={"payload_json": json.dumps(payload)},
+                   arquivos={"files[0]": (ARQ_BACKUP_VENDAS, dados, "application/octet-stream")})
+    _vendas["backup_msg"] = msg["id"]
+    try:  # mantém só os últimos backups
+        msgs = await dc("GET", f"/channels/{canal}/messages", params={"limit": 50})
+        bot = (await eu())["id"]
+        meus = [m for m in msgs if m["author"]["id"] == bot and any(a["filename"] == ARQ_BACKUP_VENDAS for a in m.get("attachments", []))]
+        for velho in meus[MANTER_BACKUPS:]:
+            await dc("DELETE", f'/channels/{canal}/messages/{velho["id"]}')
+    except ErroDiscord as erro:
+        log.warning("Não consegui limpar backups antigos: %s", erro)
+
+
+def _backup_depois(segundos: float = 4) -> None:
+    global _tarefa_backup
+    _vendas["sujo"] = True
+    if _tarefa_backup and not _tarefa_backup.done():
+        return
+
+    async def _rodar():
+        await asyncio.sleep(segundos)
+        while _vendas.get("sujo"):
+            _vendas["sujo"] = False
+            for tentativa in range(3):
+                try:
+                    await backup_vendas()
+                    break
+                except Exception as erro:
+                    log.warning("Backup do banco de vendas falhou (%s); tentando de novo.", erro)
+                    await asyncio.sleep(10)
+            else:
+                _vendas["sujo"] = True
+                await asyncio.sleep(30)
+
+    try:
+        _tarefa_backup = asyncio.get_running_loop().create_task(_rodar())
+    except RuntimeError:
+        pass
+
+
+async def _ultimo_backup() -> tuple[dict | None, str]:
+    canal = await _canal_backup_vendas()
+    msgs = await dc("GET", f"/channels/{canal}/messages", params={"limit": 50})
+    bot = (await eu())["id"]
+    for m in msgs:  # da mais nova para a mais antiga
+        if m["author"]["id"] != bot:
+            continue
+        anexo = next((a for a in m.get("attachments", []) if a["filename"] == ARQ_BACKUP_VENDAS), None)
+        if anexo:
+            return {"msg": m, "anexo": anexo}, canal
+    return None, canal
+
+
+async def _restaurar(backup: dict) -> None:
+    global _db
+    resp = await cliente_web().get(await _refrescar_url(backup["anexo"]["url"]))
+    resp.raise_for_status()
+    os.makedirs(os.path.dirname(VENDAS_DB), exist_ok=True)
+    temporario = VENDAS_DB + ".restaurando"
+    with open(temporario, "wb") as f:
+        f.write(resp.content)
+    teste = sqlite3.connect(temporario)
+    try:
+        ok = teste.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        teste.execute("SELECT COUNT(*) FROM pedidos").fetchone()
+    finally:
+        teste.close()
+    if not ok:
+        raise RuntimeError("backup corrompido")
+    if _db is not None:
+        _db.close()
+    os.replace(temporario, VENDAS_DB)
+    _db = _abrir_db(VENDAS_DB)
+    _vendas["restaurado"] = backup["msg"]["id"]
+
+
+async def iniciar_vendas() -> None:
+    """Restaura o banco do último backup (ou cria um novo, se nunca houve backup) e deixa o sistema pronto."""
+    global _db
+    async with _vendas_lock:
+        if _vendas["pronto"]:
+            return
+        if Fernet is None:
+            _vendas["aviso"] = "biblioteca cryptography não instalada"
+            return
+        try:
+            backup, _ = await _ultimo_backup()
+        except Exception as erro:
+            _vendas["aviso"] = f"não consegui ler os backups ({erro}); tentando de novo"
+            log.warning("Vendas: %s", _vendas["aviso"])
+            return  # nunca começa um banco vazio sem ter certeza de que não existe backup
+        try:
+            if backup:
+                await _restaurar(backup)
+                log.info("Vendas: banco restaurado do backup %s", backup["msg"]["id"])
+            else:
+                os.makedirs(os.path.dirname(VENDAS_DB), exist_ok=True)
+                if _db is None:
+                    if os.path.exists(VENDAS_DB):
+                        os.remove(VENDAS_DB)
+                    _db = _abrir_db(VENDAS_DB)
+                log.info("Vendas: nenhum backup encontrado, banco novo criado")
+        except Exception as erro:
+            _vendas["aviso"] = f"não consegui restaurar o backup ({erro}); tentando de novo"
+            log.exception("Vendas: falha ao restaurar")
+            return
+        assert _db is not None
+        try:
+            fund = next((c for c in await _cargos() if _norm(c["name"]) == "fundador"), None)
+            logc = next((c for c in await _canais() if c["type"] == 0 and "registrodevendas" in _norm(c["name"])), None)
+            canal_backup = await _canal_backup_vendas()
+        except Exception as erro:
+            _vendas["aviso"] = f"não consegui ler cargos/canais ({erro}); tentando de novo"
+            return
+        _db.execute("BEGIN IMMEDIATE")
+        try:
+            _semear(_db)
+            if fund and not _cfg_vendas("cargo_fundador_id"):
+                _db.execute("INSERT OR REPLACE INTO config VALUES ('cargo_fundador_id', ?)", (fund["id"],))
+            if logc and not _cfg_vendas("canal_logs_id"):
+                _db.execute("INSERT OR REPLACE INTO config VALUES ('canal_logs_id', ?)", (logc["id"],))
+            _db.execute("INSERT OR REPLACE INTO config VALUES ('canal_backup_id', ?)", (canal_backup,))
+            _db.execute("COMMIT")
+        except Exception:
+            _db.execute("ROLLBACK")
+            raise
+        _vendas.update(pronto=True, aviso=None, iniciado=time.time(), escritas=0)
+    if not backup:
+        await backup_vendas("banco criado")
+    _paineis_depois(2, criar=True)
+
+
+async def _rechecar_backup() -> None:
+    """Num deploy, a instância antiga pode salvar um backup segundos depois de a nova já ter restaurado.
+    Se isso acontecer e esta instância ainda não alterou nada, ela restaura a versão mais nova."""
+    if not _vendas["pronto"] or _vendas["rechecagens"] >= 2 or time.time() - _vendas["iniciado"] < 40:
+        return
+    _vendas["rechecagens"] += 1
+    try:
+        backup, _ = await _ultimo_backup()
+    except Exception:
+        return
+    if not backup or backup["msg"]["id"] in (_vendas["restaurado"], _vendas["backup_msg"]):
+        return
+    if f'instância {_vendas["instancia"]}' in backup["msg"].get("content", ""):
+        return
+    if _vendas["escritas"] == 0:
+        log.info("Vendas: backup mais novo de outra instância encontrado; restaurando")
+        await _restaurar(backup)
+    else:
+        log.warning("Vendas: existe um backup mais novo de outra instância, mas esta já gravou dados; mantendo o atual")
+
+
+async def registrar_venda_log(texto: str) -> None:
+    canal = _cfg_vendas("canal_logs_id")
+    if canal:
+        try:
+            await dc("POST", f"/channels/{canal}/messages", corpo={"content": texto[:2000], "allowed_mentions": {"parse": []}})
+        except ErroDiscord as erro:
+            log.warning("Falha no registro de vendas: %s", erro)
+
+
+# ── painéis de venda (1 por canal de jogo) ──
+
+def _embed_painel(j: sqlite3.Row) -> dict:
+    produtos = _q("SELECT * FROM produtos WHERE jogo = ? AND ativo = 1", (j["id"],))
+    produtos = sorted(produtos, key=lambda p: _ORDEM_PLANOS.get(p["plano"], 99))
+    tabela = "\n".join(f'`{p["nome"].replace("Key ", ""):<11}` **{_reais_c(p["preco_centavos"])}**' for p in produtos) \
+        or "_Nenhum plano à venda no momento._"
+    intro = j["descricao"] or (f'Keys para **{j["nome"]}** na plataforma **{j["plataforma"]}**.\n'
+                               "Escolha o plano no menu abaixo e finalize a compra num canal privado só seu.")
+    descricao = (f"{intro}\n\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔑 **PLANOS**\n{tabela}\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n"
+                 "💳 **PAGAMENTO**\nPix com QR Code e copia e cola, gerado com o **valor exato** do plano escolhido. "
+                 "A equipe confere cada pagamento antes de liberar a key.\n\n"
+                 "🛒 **COMO COMPRAR**\n**1.** Escolha o plano no menu abaixo\n"
+                 "**2.** Um canal privado de pagamento é criado só para você\n"
+                 "**3.** Pague o Pix e clique em **CONFIRMAR PAGAMENTO**\n"
+                 "**4.** Informe o nome completo de quem pagou\n"
+                 "**5.** Aprovado o pagamento, sua key chega num **canal privado de entrega**")
+    embed: dict[str, Any] = {"title": f'{j["emoji"] or "🟢"} ECO CHEATS • {j["nome"].upper()} {j["plataforma"].upper()}',
+                             "description": descricao[:4096], "color": NEON,
+                             "footer": {"text": "ECO CHEATS • Pagamento via Pix • Entrega em canal privado"}}
+    if j["imagem_url"]:
+        embed["image"] = {"url": j["imagem_url"]}
+    return embed
+
+
+def _menu_painel(j: sqlite3.Row) -> dict:
+    opcoes = []
+    for p in sorted(_q("SELECT * FROM produtos WHERE jogo = ? AND ativo = 1", (j["id"],)),
+                    key=lambda p: _ORDEM_PLANOS.get(p["plano"], 99)):
+        if p["usa_keys"]:
+            est = _estoque(j["id"], p["plano"])["livre"]
+            estoque = f"Estoque: {est}" if est else "Esgotado"
+        else:
+            estoque = "Estoque: ∞"
+        opcoes.append({"label": p["nome"][:100], "value": p["plano"], "emoji": {"name": "🔑"},
+                       "description": f'Preço: {_reais_c(p["preco_centavos"])} | {estoque}'[:100]})
+    menu: dict[str, Any] = {"type": 3, "custom_id": f'ecvd:menu:{j["id"]}', "placeholder": "➡️ Clique aqui para ver as opções",
+                            "min_values": 1, "max_values": 1}
+    if opcoes:
+        menu["options"] = opcoes
+    else:
+        menu.update(options=[{"label": "Vendas pausadas", "value": "nada"}], disabled=True, placeholder="Vendas pausadas no momento")
+    return {"type": 1, "components": [menu]}
+
+
+async def _achar_painel_existente(canal_id: str, jid: str) -> str | None:
+    """Antes de publicar, procura um painel deste bot já no canal (evita duplicar)."""
+    try:
+        msgs = await dc("GET", f"/channels/{canal_id}/messages", params={"limit": 50})
+    except ErroDiscord:
+        return None
+    bot = (await eu())["id"]
+    for m in msgs:
+        if m["author"]["id"] != bot:
+            continue
+        for linha in m.get("components", []):
+            for c in linha.get("components", []):
+                if c.get("custom_id") == f"ecvd:menu:{jid}":
+                    return m["id"]
+    return None
+
+
+async def atualizar_painel(jid: str, criar: bool) -> str:
+    j = _jogo(jid)
+    if not j["canal_id"]:
+        return f'{_rotulo_jogo(j)}: sem canal configurado'
+    payload = {"embeds": [_embed_painel(j)], "components": [_menu_painel(j)], "allowed_mentions": {"parse": []}}
+    msg_id = j["mensagem_id"]
+    if msg_id:
+        try:
+            await _postar(j["canal_id"], payload, editar_id=msg_id)
+            return f'{_rotulo_jogo(j)}: atualizado'
+        except ErroDiscord as erro:
+            if erro.codigo != 10008 and erro.status != 404:
+                raise
+            msg_id = None  # a mensagem foi apagada
+    if not criar:
+        return f'{_rotulo_jogo(j)}: sem painel publicado'
+    existente = await _achar_painel_existente(j["canal_id"], jid)
+    if existente:
+        await _postar(j["canal_id"], payload, editar_id=existente)
+        novo_id, acao = existente, "reaproveitado"
+    else:
+        novo_id, acao = (await _postar(j["canal_id"], payload))["id"], "publicado"
+    with _tx() as conn:
+        conn.execute("UPDATE jogos SET mensagem_id = ? WHERE id = ?", (novo_id, jid))
+    return f'{_rotulo_jogo(j)}: {acao}'
+
+
+async def sincronizar_paineis(criar: bool, jogos: set[str] | None = None) -> list[str]:
+    resultado = []
+    for j in _q("SELECT id FROM jogos WHERE ativo = 1 ORDER BY ordem"):
+        if jogos is not None and j["id"] not in jogos:
+            continue
+        try:
+            resultado.append(await atualizar_painel(j["id"], criar))
+        except ErroDiscord as erro:
+            resultado.append(f'{j["id"]}: erro — {erro}')
+            log.warning("Painel %s: %s", j["id"], erro)
+    return resultado
+
+
+_paineis_pendentes: dict[str, Any] = {"jogos": set(), "todos": False, "criar": False}
+
+
+def _paineis_depois(segundos: float = 5, criar: bool = False, jogo: str | None = None) -> None:
+    global _tarefa_paineis
+    if jogo:
+        _paineis_pendentes["jogos"].add(jogo)
+    else:
+        _paineis_pendentes["todos"] = True
+    _paineis_pendentes["criar"] = _paineis_pendentes["criar"] or criar
+    if _tarefa_paineis and not _tarefa_paineis.done():
+        return
+
+    async def _rodar():
+        await asyncio.sleep(segundos)
+        while _paineis_pendentes["todos"] or _paineis_pendentes["jogos"]:
+            jogos = None if _paineis_pendentes["todos"] else set(_paineis_pendentes["jogos"])
+            criar_agora = _paineis_pendentes["criar"]
+            _paineis_pendentes.update(jogos=set(), todos=False, criar=False)
+            try:
+                await sincronizar_paineis(criar_agora, jogos)
+            except Exception:
+                log.exception("Falha ao atualizar os painéis de venda")
+
+    try:
+        _tarefa_paineis = asyncio.get_running_loop().create_task(_rodar())
+    except RuntimeError:
+        pass
+
+
+# ── canais privados (pagamento e entrega) ──
+
+async def _categoria_rotativa(prefixo: str) -> str | None:
+    """Categoria privada com espaço (o Discord limita 50 canais por categoria); cria 'PREFIXO 2', 'PREFIXO 3'…"""
+    canais = await _canais()
+    cats = sorted([c for c in canais if c["type"] == 4 and c["name"].startswith(prefixo)], key=lambda c: c["position"])
+    for cat in cats:
+        if sum(1 for c in canais if c.get("parent_id") == cat["id"]) < 48:
+            return cat["id"]
+    gid, bot = await servidor_id(), await eu()
+    perms = [{"id": gid, "type": 0, "allow": "0", "deny": str(VER)},
+             {"id": bot["id"], "type": 1, "allow": str(VER | ENVIAR | HISTORICO), "deny": "0"}]
+    fund = _cfg_vendas("cargo_fundador_id")
+    if fund:
+        perms.append({"id": fund, "type": 0, "allow": str(VER | HISTORICO), "deny": "0"})
+    nome = prefixo if not cats else f"{prefixo} {len(cats) + 1}"
+    return (await dc("POST", f"/guilds/{gid}/channels", corpo={"name": nome, "type": 4, "permission_overwrites": perms},
+                     motivo="Vendas ECO CHEATS"))["id"]
+
+
+async def _canal_privado_venda(prefixo_nome: str, usuario_id: str, nome_pessoa: str, pedido_id: str, categoria_prefixo: str,
+                               topico: str, cliente_escreve: bool = True) -> dict:
+    gid, bot = await servidor_id(), await eu()
+    fund = _cfg_vendas("cargo_fundador_id")
+    acesso_cliente = VER | HISTORICO | (ENVIAR | ANEXAR if cliente_escreve else 0)
+    perms: list[dict[str, Any]] = [
+        {"id": gid, "type": 0, "allow": "0", "deny": str(VER)},
+        {"id": usuario_id, "type": 1, "allow": str(acesso_cliente), "deny": "0" if cliente_escreve else str(ENVIAR)},
+        {"id": bot["id"], "type": 1, "allow": str(VER | ENVIAR | HISTORICO | ANEXAR | EMBED_LINKS | GERENCIAR_MSG), "deny": "0"},
+    ]
+    if fund:
+        perms.append({"id": fund, "type": 0, "allow": str(VER | ENVIAR | HISTORICO | ANEXAR | GERENCIAR_MSG), "deny": "0"})
+    base = f'{prefixo_nome}-{_slug(nome_pessoa, 28) or "cliente"}'[:90].strip("-")
+    existentes = {c["name"] for c in await _canais()}
+    nome = base if base not in existentes else f"{base}-{pedido_id[-4:].lower()}"
+    return await _criar_canal_privado(nome, perms, await _categoria_rotativa(categoria_prefixo), topico, f"Pedido {pedido_id}")
+
+
+# ── mensagem do pedido ──
+
+def _embed_pedido(p: sqlite3.Row, pix: str | None = None, com_qr: bool = False, extra: str | None = None) -> dict:
+    j = _jogo(p["jogo"])
+    st = p["status"]
+    cor = {AG_PAGAMENTO: NEON, AG_CONFERENCIA: CORES["amarelo"], REJEITADO: CORES["vermelho"],
+           CANCELADO: CORES["cinza"], EXPIRADO: CORES["cinza"], AG_ESTOQUE: CORES["laranja"]}.get(st, NEON)
+    if st == AG_PAGAMENTO:
+        desc = (f'Olá, <@{p["usuario_id"]}>! Este canal é **privado**: só você e a equipe conseguem ver.\n\n'
+                "**1.** Pague o Pix com o **valor exato** (QR Code ou copia e cola)\n"
+                "**2.** Clique em **CONFIRMAR PAGAMENTO** e informe o nome completo de quem pagou\n"
+                "**3.** A equipe confere o Pix e libera sua key num canal privado de entrega\n\n"
+                "⚠️ Clicar em CONFIRMAR PAGAMENTO **não** libera a key sozinho: a equipe confere o recebimento antes.")
+    elif st == AG_CONFERENCIA:
+        desc = (f'<@{p["usuario_id"]}> informou o pagamento. A equipe está conferindo o Pix.\n\n'
+                f'👤 **Pagador:** {decifrar(p["pagador_cifrado"])}')
+    else:
+        desc = extra or ""
+    campos = [
+        {"name": "🎮 Jogo", "value": _rotulo_jogo(j), "inline": True},
+        {"name": "📦 Produto", "value": p["produto_nome"], "inline": True},
+        {"name": "⏳ Duração", "value": _duracao(p["dias"]), "inline": True},
+        {"name": "💰 Valor", "value": f'**{_reais_c(p["preco_centavos"])}**', "inline": True},
+        {"name": "🆔 Pedido", "value": f'`{p["id"]}`', "inline": True},
+        {"name": "📌 Status", "value": ROTULO_STATUS.get(st, st), "inline": True},
+    ]
+    if pix and st == AG_PAGAMENTO:
+        campos.append({"name": "📋 Pix copia e cola", "value": f"```{pix}```"[:1024], "inline": False})
+        if p["link_pagamento"]:
+            campos.append({"name": "🔗 Link de pagamento", "value": p["link_pagamento"][:1024], "inline": False})
+    embed: dict[str, Any] = {"title": f'🧾 Pedido {p["id"]}', "description": desc[:4096], "color": cor, "fields": campos,
+                             "footer": {"text": "ECO CHEATS • Pague somente pelos dados deste canal • o pedido expira em 24 h sem pagamento"
+                                        if st == AG_PAGAMENTO else "ECO CHEATS • Vendas automáticas"}}
+    if com_qr:
+        embed["image"] = {"url": "attachment://pix.png"}
+    elif pix and st == AG_PAGAMENTO:
+        embed["image"] = {"url": _qr_url_online(pix)}
+    return embed
+
+
+def _botoes_cliente(p: sqlite3.Row) -> list[dict]:
+    botoes = [_botao("CONFIRMAR PAGAMENTO", f'ecvd:pagar:{p["id"]}', 3, "✅")]
+    if p["link_pagamento"]:
+        botoes.append({"type": 2, "style": 5, "label": "Pagar pelo link", "url": p["link_pagamento"], "emoji": {"name": "💳"}})
+    botoes.append(_botao("CANCELAR PEDIDO", f'ecvd:cancelar:{p["id"]}', 4, "✖️"))
+    return [_linha(*botoes)]
+
+
+def _botoes_admin(pid: str) -> list[dict]:
+    return [_linha(_botao("APROVAR PAGAMENTO", f"ecvd:aprovar:{pid}", 3, "✅"),
+                   _botao("REJEITAR PAGAMENTO", f"ecvd:rejeitar:{pid}", 4, "⛔"))]
+
+
+def _pedido(pid: str) -> sqlite3.Row | None:
+    return _q1("SELECT * FROM pedidos WHERE id = ?", (pid,))
+
+
+async def _editar_msg_pedido(p: sqlite3.Row, embed: dict, componentes: list[dict]) -> None:
+    if not (p["canal_pagamento_id"] and p["mensagem_pedido_id"]) or p["pagamento_apagado"]:
+        return
+    try:
+        await dc("PATCH", f'/channels/{p["canal_pagamento_id"]}/messages/{p["mensagem_pedido_id"]}',
+                 corpo={"embeds": [embed], "components": componentes, "attachments": []})
+    except ErroDiscord as erro:
+        log.warning("Não consegui atualizar a mensagem do pedido %s: %s", p["id"], erro)
+
+
+# ── compra ──
+
+async def _vendas_menu(r: _Resposta, jid: str, plano: str) -> None:
+    inter = r.inter
+    uid = str(inter.user.id)
+    await r.enviar(6)  # responde na hora (sem mexer no painel); o resto vem como mensagem só para a pessoa
+    if not _vendas["pronto"]:
+        await r.efemera("O sistema de vendas está iniciando. Tente de novo em alguns segundos.")
+        return
+    if time.time() - _cliques_menu.get(uid, 0) < 4:
+        await r.efemera("Calma! Seu pedido anterior ainda está sendo criado.")
+        return
+    _cliques_menu[uid] = time.time()
+    try:
+        j = _jogo(jid)
+        prod = _produto(jid, plano)
+    except ErroDiscord:
+        await r.efemera("Esta opção não existe mais. Atualize o painel.")
+        return
+    if not j["ativo"] or not prod["ativo"]:
+        await r.efemera("Este plano não está à venda no momento.")
+        return
+    async with _vendas_lock:
+        aberto = _q1(f"SELECT * FROM pedidos WHERE usuario_id = ? AND jogo = ? AND status IN "
+                     f"({','.join('?' * len(STATUS_ABERTOS_VENDA))}) ORDER BY criado_em DESC", (uid, jid, *STATUS_ABERTOS_VENDA))
+        if aberto:
+            recente = datetime.fromisoformat(aberto["criado_em"]) > _agora() - timedelta(seconds=90)
+            if not aberto["canal_pagamento_id"] and recente:
+                await r.efemera("Seu pedido já está sendo criado. Aguarde alguns segundos.")
+                return
+            if aberto["canal_pagamento_id"] and not aberto["pagamento_apagado"] and await _canal_existe(aberto["canal_pagamento_id"]):
+                await r.efemera(f'Você já tem um pedido aberto deste jogo: <#{aberto["canal_pagamento_id"]}> (pedido `{aberto["id"]}`).')
+                return
+            if aberto["status"] != AG_PAGAMENTO:
+                await r.efemera(f'Você já tem um pedido em andamento deste jogo (`{aberto["id"]}`). Se precisar, abra um ticket de suporte.')
+                return
+            with _tx() as conn:  # o canal de pagamento sumiu: encerra o pedido antigo sem pagamento
+                conn.execute("UPDATE pedidos SET status = ?, pagamento_apagado = 1 WHERE id = ? AND status = ?",
+                             (CANCELADO, aberto["id"], AG_PAGAMENTO))
+                _auditar(conn, "cancelado_canal_sumiu", aberto["id"])
+        if prod["usa_keys"] and _estoque(jid, plano)["livre"] <= 0:
+            await r.efemera(f'😕 **{prod["nome"]}** de {_rotulo_jogo(j)} está **esgotado** no momento. Avise a equipe ou tente mais tarde.')
+            _paineis_depois(1, jogo=jid)
+            return
+        pid = _novo_id_pedido()
+        nome = getattr(inter.user, "display_name", None) or inter.user.name
+        link = prod["link_pagamento"] or _env("PIX_LINK")
+        with _tx() as conn:
+            conn.execute("INSERT INTO pedidos (id, usuario_id, usuario_nome, jogo, plano, produto_nome, dias, preco_centavos, "
+                         "status, criado_em, link_pagamento) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (pid, uid, nome, jid, plano, prod["nome"], prod["dias"], prod["preco_centavos"], AG_PAGAMENTO, _agora_iso(), link))
+            _auditar(conn, "pedido_criado", pid, uid, f'{jid}/{plano} {_reais_c(prod["preco_centavos"])}')
+    try:
+        canal = await _canal_privado_venda(f"venda-painel-{jid}", uid, nome if _slug(nome) else inter.user.name, pid, "🧾 PAGAMENTOS",
+                                           f'Pedido {pid} • {_rotulo_jogo(j)} • {prod["nome"]} • {_reais_c(prod["preco_centavos"])} • cliente <@{uid}>')
+    except Exception:
+        with _tx() as conn:
+            conn.execute("UPDATE pedidos SET status = ?, pagamento_apagado = 1 WHERE id = ?", (CANCELADO, pid))
+            _auditar(conn, "erro_criar_canal", pid)
+        raise
+    with _tx() as conn:
+        conn.execute("UPDATE pedidos SET canal_pagamento_id = ? WHERE id = ?", (canal["id"], pid))
+    p = _pedido(pid)
+    pix = gerar_pix(p["preco_centavos"] / 100, pid.replace("-", ""))
+    payload: dict[str, Any] = {"content": f"<@{uid}>", "allowed_mentions": {"parse": [], "users": [uid]},
+                               "components": _botoes_cliente(p)}
+    png = _qr_png(pix) if pix else None
+    if png:
+        payload["embeds"] = [_embed_pedido(p, pix, com_qr=True)]
+        payload["attachments"] = [{"id": 0, "filename": "pix.png"}]
+        msg = await dc("POST", f'/channels/{canal["id"]}/messages', dados={"payload_json": json.dumps(payload)},
+                       arquivos={"files[0]": ("pix.png", png, "image/png")})
+    else:
+        payload["embeds"] = [_embed_pedido(p, pix)]
+        msg = await dc("POST", f'/channels/{canal["id"]}/messages', corpo=payload)
+    if pix:
+        await dc("POST", f'/channels/{canal["id"]}/messages', corpo={"content": pix, "allowed_mentions": {"parse": []}})
+        await dc("POST", f'/channels/{canal["id"]}/messages', corpo={
+            "content": "☝️ Código Pix copia e cola acima (no celular: segure a mensagem → **Copiar texto**).",
+            "allowed_mentions": {"parse": []}})
+    else:
+        fund = _cfg_vendas("cargo_fundador_id")
+        await dc("POST", f'/channels/{canal["id"]}/messages', corpo={
+            "content": (f"<@&{fund}> " if fund else "") + "⚠️ A chave Pix não está configurada no Render (PIX_CHAVE). "
+                       "A equipe vai mandar os dados de pagamento aqui.", "allowed_mentions": {"parse": [], "roles": [fund] if fund else []}})
+    with _tx() as conn:
+        conn.execute("UPDATE pedidos SET mensagem_pedido_id = ? WHERE id = ?", (msg["id"], pid))
+    await r.efemera(f'✅ Pedido `{pid}` criado! Seu canal de pagamento é <#{canal["id"]}>.')
+    await registrar_venda_log(f'🛒 Pedido `{pid}` aberto por <@{uid}> — {_rotulo_jogo(j)} • {prod["nome"]} • '
+                              f'{_reais_c(prod["preco_centavos"])} • <#{canal["id"]}>')
+    _paineis_depois(2, jogo=jid)
+
+
+async def _vendas_pagar(r: _Resposta, pid: str) -> None:
+    p = _pedido(pid)
+    if not p or str(r.inter.user.id) != p["usuario_id"]:
+        await r.efemera("Só quem fez o pedido pode confirmar o pagamento.")
+        return
+    if p["status"] != AG_PAGAMENTO:
+        await r.efemera("O pagamento deste pedido já foi informado. Agora é só aguardar a equipe conferir.")
+        return
+    await r.enviar(9, {"custom_id": f"ecvd:m_pagador:{pid}", "title": "Confirmar pagamento",
+                       "components": [_linha({"type": 4, "custom_id": "nome", "style": 1, "label": "Nome completo do pagador",
+                                              "placeholder": "Ex.: Maria da Silva Souza", "min_length": 5, "max_length": 100,
+                                              "required": True})]})
+
+
+async def _vendas_modal_pagador(r: _Resposta, pid: str) -> None:
+    inter = r.inter
+    nome = re.sub(r"[`*_~|<>@#\\]", "", _valor_modal(inter.data, "nome") or "")
+    nome = re.sub(r"\s+", " ", nome).strip()
+    if len(nome) < 5 or len(nome.split()) < 2:
+        await r.efemera("Digite o **nome completo** do pagador (nome e sobrenome). Clique em CONFIRMAR PAGAMENTO de novo.")
+        return
+    async with _lock_pedido(pid):
+        p = _pedido(pid)
+        if not p or str(inter.user.id) != p["usuario_id"]:
+            await r.efemera("Só quem fez o pedido pode confirmar o pagamento.")
+            return
+        with _tx() as conn:
+            mudou = conn.execute("UPDATE pedidos SET status = ?, pagador_cifrado = ?, informado_em = ? WHERE id = ? AND status = ?",
+                                 (AG_CONFERENCIA, cifrar(nome), _agora_iso(), pid, AG_PAGAMENTO)).rowcount
+            if mudou:
+                _auditar(conn, "pagamento_informado", pid, p["usuario_id"])
+        if not mudou:
+            await r.efemera("O pagamento deste pedido já foi informado.")
+            return
+        p = _pedido(pid)
+    await r.enviar(7, {"embeds": [_embed_pedido(p)], "components": _botoes_admin(pid), "attachments": []})
+    fund = _cfg_vendas("cargo_fundador_id")
+    await dc("POST", f'/channels/{p["canal_pagamento_id"]}/messages', corpo={
+        "content": (f"🔔 <@&{fund}> " if fund else "🔔 ") + f'Pagamento informado no pedido `{pid}`: confira se o Pix de '
+                   f'**{_reais_c(p["preco_centavos"])}** caiu na conta e aprove ou rejeite na mensagem do pedido.\n'
+                   f'<@{p["usuario_id"]}>, aguarde: a equipe vai conferir o recebimento.',
+        "allowed_mentions": {"parse": [], "roles": [fund] if fund else [], "users": [p["usuario_id"]]}})
+    await registrar_venda_log(f'🔎 Pedido `{pid}` aguardando conferência — <@{p["usuario_id"]}> informou pagamento de '
+                              f'{_reais_c(p["preco_centavos"])} (pagador: {nome}).')
+
+
+async def _vendas_cancelar(r: _Resposta, pid: str, confirmado: bool) -> None:
+    inter = r.inter
+    p = _pedido(pid)
+    if not p:
+        await r.efemera("Pedido não encontrado.")
+        return
+    dono = str(inter.user.id) == p["usuario_id"]
+    if not (dono or _eh_fundador(inter)):
+        await r.efemera("Só quem fez o pedido pode cancelar.")
+        return
+    if p["status"] != AG_PAGAMENTO:
+        await r.efemera("Este pedido não pode mais ser cancelado (o pagamento já foi informado ou o pedido foi encerrado).")
+        return
+    if not confirmado:
+        await r.enviar(4, {"content": f'Cancelar o pedido `{pid}`? Se você já pagou, **não cancele**: clique em CONFIRMAR PAGAMENTO.',
+                           "flags": 64, "components": [_linha(_botao("Sim, cancelar pedido", f"ecvd:cancelar_ok:{pid}", 4, "✖️"))]})
+        return
+    async with _lock_pedido(pid):
+        with _tx() as conn:
+            mudou = conn.execute("UPDATE pedidos SET status = ?, cancelado_por = ?, fechar_pagamento_em = ? WHERE id = ? AND status = ?",
+                                 (CANCELADO, str(inter.user.id), (_agora() + APAGAR_PAGAMENTO_APOS_CANCELAR).isoformat(), pid, AG_PAGAMENTO)).rowcount
+            if mudou:
+                _auditar(conn, "cancelado", pid, str(inter.user.id))
+    if not mudou:
+        await r.enviar(7, {"content": "Este pedido já foi encerrado.", "components": []})
+        return
+    await r.enviar(7, {"content": "🗑️ Pedido cancelado. Este canal será apagado em instantes.", "components": []})
+    p = _pedido(pid)
+    await _editar_msg_pedido(p, _embed_pedido(p, extra=f"🗑️ Pedido cancelado por <@{inter.user.id}>."), [])
+    await registrar_venda_log(f'🗑️ Pedido `{pid}` cancelado por <@{inter.user.id}>.')
+    _paineis_depois(2, jogo=p["jogo"])
+
+
+async def _vendas_pedir_aprovacao(r: _Resposta, pid: str, aprovar: bool) -> None:
+    if not _eh_fundador(r.inter):
+        await r.efemera("⛔ Só quem tem o cargo **FUNDADOR** pode aprovar ou rejeitar pagamentos.")
+        return
+    p = _pedido(pid)
+    if not p:
+        await r.efemera("Pedido não encontrado.")
+        return
+    if aprovar and p["status"] != AG_CONFERENCIA:
+        await r.efemera(f'Este pedido não está aguardando conferência (status: {ROTULO_STATUS.get(p["status"], p["status"])}).')
+        return
+    if not aprovar and p["status"] not in (AG_CONFERENCIA, AG_PAGAMENTO):
+        await r.efemera(f'Este pedido não pode mais ser rejeitado (status: {ROTULO_STATUS.get(p["status"], p["status"])}).')
+        return
+    if aprovar:
+        await r.enviar(9, {"custom_id": f"ecvd:m_aprovar:{pid}", "title": f"Aprovar {pid}",
+                           "components": [_linha({"type": 4, "custom_id": "confirmo", "style": 1,
+                                                  "label": f'Pix de {_reais_c(p["preco_centavos"])} caiu? Digite CONFIRMO'[:45],
+                                                  "placeholder": "CONFIRMO", "min_length": 1, "max_length": 20, "required": True})]})
+    else:
+        await r.enviar(9, {"custom_id": f"ecvd:m_rejeitar:{pid}", "title": f"Rejeitar {pid}",
+                           "components": [_linha({"type": 4, "custom_id": "motivo", "style": 2, "label": "Motivo da rejeição",
+                                                  "placeholder": "Ex.: Pix não encontrado no extrato", "min_length": 3,
+                                                  "max_length": 300, "required": True})]})
+
+
+async def _vendas_modal_aprovar(r: _Resposta, pid: str) -> None:
+    inter = r.inter
+    if not _eh_fundador(inter):
+        await r.efemera("⛔ Só quem tem o cargo **FUNDADOR** pode aprovar pagamentos.")
+        return
+    if _norm(_valor_modal(inter.data, "confirmo") or "") != "confirmo":
+        await r.efemera("Aprovação **não** feita: é preciso digitar CONFIRMO depois de conferir o Pix.")
+        return
+    quem = str(inter.user.id)
+    async with _lock_pedido(pid):
+        with _tx() as conn:
+            mudou = conn.execute("UPDATE pedidos SET status = ?, aprovado_por = ?, aprovado_em = ? WHERE id = ? AND status = ?",
+                                 (APROVADO, quem, _agora_iso(), pid, AG_CONFERENCIA)).rowcount
+            if mudou:
+                _auditar(conn, "aprovado", pid, quem, "Pix conferido (digitou CONFIRMO)")
+        p = _pedido(pid)
+    if not mudou:
+        await r.efemera(f'Este pedido já foi decidido (status: {ROTULO_STATUS.get(p["status"], p["status"]) if p else "?"}).')
+        return
+    nome_quem = getattr(inter.user, "display_name", None) or inter.user.name
+    await r.enviar(7, {"embeds": [_embed_pedido(p, extra=f"✅ Pagamento aprovado por <@{quem}> em {_fmt(_agora())}. Preparando a entrega…")],
+                       "components": [], "attachments": []})
+    await registrar_venda_log(f'✅ Pedido `{pid}` aprovado por <@{quem}> ({nome_quem}) — {_reais_c(p["preco_centavos"])}.')
+    await entregar_pedido(pid)
+
+
+async def _vendas_modal_rejeitar(r: _Resposta, pid: str) -> None:
+    inter = r.inter
+    if not _eh_fundador(inter):
+        await r.efemera("⛔ Só quem tem o cargo **FUNDADOR** pode rejeitar pagamentos.")
+        return
+    motivo = re.sub(r"\s+", " ", (_valor_modal(inter.data, "motivo") or "")).strip()[:300] or "não informado"
+    quem = str(inter.user.id)
+    async with _lock_pedido(pid):
+        with _tx() as conn:
+            mudou = conn.execute("UPDATE pedidos SET status = ?, rejeitado_por = ?, rejeitado_em = ?, motivo_rejeicao = ?, "
+                                 "fechar_pagamento_em = ? WHERE id = ? AND status IN (?, ?)",
+                                 (REJEITADO, quem, _agora_iso(), motivo, (_agora() + APAGAR_PAGAMENTO_APOS_REJEICAO).isoformat(),
+                                  pid, AG_CONFERENCIA, AG_PAGAMENTO)).rowcount
+            if mudou:
+                _auditar(conn, "rejeitado", pid, quem, motivo)
+        p = _pedido(pid)
+    if not mudou:
+        await r.efemera("Este pedido já foi decidido.")
+        return
+    await r.enviar(7, {"embeds": [_embed_pedido(p, extra=f"❌ Pagamento rejeitado por <@{quem}>.\n**Motivo:** {motivo}")],
+                       "components": [], "attachments": []})
+    await dc("POST", f'/channels/{p["canal_pagamento_id"]}/messages', corpo={
+        "content": (f'<@{p["usuario_id"]}> ❌ O pagamento do pedido `{pid}` **não foi aprovado**.\n**Motivo:** {motivo}\n'
+                    "Se você pagou de verdade, abra um ticket de suporte e envie o comprovante. Este canal será apagado em 10 minutos."),
+        "allowed_mentions": {"parse": [], "users": [p["usuario_id"]]}})
+    await _dm(p["usuario_id"], {"title": "❌ Pagamento não aprovado", "color": CORES["vermelho"],
+                                "description": f'Seu pedido `{pid}` ({p["produto_nome"]}) foi rejeitado.\n**Motivo:** {motivo}\n'
+                                               "Se você pagou, abra um ticket de suporte no servidor com o comprovante."})
+    await registrar_venda_log(f'❌ Pedido `{pid}` rejeitado por <@{quem}>. Motivo: {motivo}')
+    _paineis_depois(2, jogo=p["jogo"])
+
+
+async def _dm(uid: str, embed: dict) -> bool:
+    try:
+        canal = await dc("POST", "/users/@me/channels", corpo={"recipient_id": uid})
+        await dc("POST", f'/channels/{canal["id"]}/messages', corpo={"embeds": [embed]})
+        return True
+    except ErroDiscord:
+        return False
+
+
+# ── entrega ──
+
+def _config_entrega(jid: str, plano: str) -> sqlite3.Row | None:
+    return _q1("SELECT * FROM entregas_config WHERE jogo = ? AND plano = ?", (jid, plano)) or \
+        _q1("SELECT * FROM entregas_config WHERE jogo = ? AND plano = '*'", (jid,))
+
+
+async def entregar_pedido(pid: str) -> str:
+    """Entrega um pedido APROVADO: reserva a key (transação), cria o canal privado de entrega e manda tudo.
+    Nunca entrega duas vezes: cada passo confere o status no banco."""
+    async with _lock_pedido(pid):
+        p = _pedido(pid)
+        if not p or p["status"] not in (APROVADO, AG_ESTOQUE, ENTREGANDO):
+            return "nada a fazer"
+        if not p["aprovado_por"]:
+            return "pedido sem aprovação registrada"  # trava extra: nada é entregue sem aprovação do FUNDADOR
+        prod = _produto(p["jogo"], p["plano"])
+        key_row = None
+        ja_avisado = p["status"] == AG_ESTOQUE
+        with _tx() as conn:
+            if prod["usa_keys"]:
+                key_row = conn.execute("SELECT * FROM keys WHERE pedido_id = ? AND status = 'reservada'", (pid,)).fetchone()
+                if not key_row:
+                    key_row = conn.execute("SELECT * FROM keys WHERE jogo = ? AND plano = ? AND status = 'disponivel' "
+                                           "ORDER BY id LIMIT 1", (p["jogo"], p["plano"])).fetchone()
+                    if key_row:
+                        conn.execute("UPDATE keys SET status = 'reservada', pedido_id = ? WHERE id = ? AND status = 'disponivel'",
+                                     (pid, key_row["id"]))
+            if prod["usa_keys"] and not key_row:
+                conn.execute("UPDATE pedidos SET status = ? WHERE id = ?", (AG_ESTOQUE, pid))
+                if not ja_avisado:
+                    _auditar(conn, "sem_estoque", pid)
+            else:
+                conn.execute("UPDATE pedidos SET status = ?, key_id = ?, entregando_desde = ? WHERE id = ?",
+                             (ENTREGANDO, key_row["id"] if key_row else None, _agora_iso(), pid))
+        p = _pedido(pid)
+        if p["status"] == AG_ESTOQUE:
+            if not ja_avisado:
+                await _avisar_sem_estoque(p)
+            return "sem estoque"
+        try:
+            await _executar_entrega(p, key_row)
+        except Exception as erro:
+            log.exception("Falha na entrega do pedido %s", pid)
+            with _tx() as conn:  # volta para APROVADO; a key continua reservada para este pedido
+                conn.execute("UPDATE pedidos SET status = ? WHERE id = ? AND status = ?", (APROVADO, pid, ENTREGANDO))
+                _auditar(conn, "erro_entrega", pid, None, str(erro)[:300])
+            fund = _cfg_vendas("cargo_fundador_id")
+            if p["canal_pagamento_id"] and not p["pagamento_apagado"]:
+                try:
+                    await dc("POST", f'/channels/{p["canal_pagamento_id"]}/messages', corpo={
+                        "content": (f"<@&{fund}> " if fund else "") + f"⚠️ Não consegui concluir a entrega do pedido `{pid}` ({erro}). "
+                                   "O pagamento continua aprovado e a key reservada. Clique para tentar de novo:",
+                        "components": [_linha(_botao("Tentar entregar de novo", f"ecvd:reentregar:{pid}", 1, "🔁"))],
+                        "allowed_mentions": {"parse": [], "roles": [fund] if fund else []}})
+                except ErroDiscord:
+                    pass
+            return f"erro: {erro}"
+    return "entregue"
+
+
+async def _avisar_sem_estoque(p: sqlite3.Row) -> None:
+    j = _jogo(p["jogo"])
+    fund = _cfg_vendas("cargo_fundador_id")
+    texto = (f"<@&{fund}> " if fund else "") + (
+        f'⚠️ **Sem keys** de {_rotulo_jogo(j)} • {p["produto_nome"]} para o pedido `{p["id"]}` (pagamento já aprovado). '
+        f'Cadastre com `/key_adicionar` e a entrega sai **automaticamente**.')
+    if p["canal_pagamento_id"] and not p["pagamento_apagado"]:
+        try:
+            await dc("POST", f'/channels/{p["canal_pagamento_id"]}/messages', corpo={
+                "content": texto + f'\n<@{p["usuario_id"]}>, seu pagamento foi aprovado! Sua key será entregue assim que o estoque for reposto.',
+                "allowed_mentions": {"parse": [], "roles": [fund] if fund else [], "users": [p["usuario_id"]]}})
+        except ErroDiscord:
+            pass
+    await registrar_venda_log(texto.replace(f"<@&{fund}> ", "") if fund else texto)
+
+
+async def _executar_entrega(p: sqlite3.Row, key_row: sqlite3.Row | None) -> None:
+    pid = p["id"]
+    j = _jogo(p["jogo"])
+    cfg = _config_entrega(p["jogo"], p["plano"])
+    uid = p["usuario_id"]
+    canal_id = p["canal_entrega_id"]
+    if canal_id and not await _canal_existe(canal_id):
+        canal_id = None
+    novo_canal = not canal_id
+    if novo_canal:
+        canal = await _canal_privado_venda(f"entrega-{p['jogo']}", uid, p["usuario_nome"] or uid[-6:], pid, "📦 ENTREGAS",
+                                           f'Entrega do pedido {pid} • {_rotulo_jogo(j)} • {p["produto_nome"]} • só o comprador e a equipe veem')
+        canal_id = canal["id"]
+        with _tx() as conn:
+            conn.execute("UPDATE pedidos SET canal_entrega_id = ? WHERE id = ?", (canal_id, pid))
+    agora = _agora()
+    expira = (agora + timedelta(days=p["dias"])) if p["dias"] else None
+    campos = [{"name": "🎮 Jogo", "value": _rotulo_jogo(j), "inline": True},
+              {"name": "📦 Produto", "value": p["produto_nome"], "inline": True},
+              {"name": "⏳ Validade", "value": _duracao(p["dias"]), "inline": True},
+              {"name": "🆔 Pedido", "value": f"`{pid}`", "inline": True},
+              {"name": "💰 Valor pago", "value": _reais_c(p["preco_centavos"]), "inline": True}]
+    await dc("POST", f"/channels/{canal_id}/messages", corpo={
+        "content": f"<@{uid}>", "allowed_mentions": {"parse": [], "users": [uid]},
+        "embeds": [{"title": "✅ Pagamento aprovado • sua entrega chegou", "color": NEON, "fields": campos,
+                    "description": ("Este canal é **privado**: só você e a equipe conseguem ver.\n"
+                                    "Guarde sua key e as instruções abaixo em um lugar seguro e **não compartilhe** com ninguém."),
+                    "footer": {"text": "ECO CHEATS • Obrigado pela compra!"}}]})
+    if key_row:
+        await dc("POST", f"/channels/{canal_id}/messages", corpo={
+            "embeds": [{"title": "🔑 Sua key", "color": NEON,
+                        "description": "A key está na mensagem logo abaixo, sozinha, para facilitar copiar (no celular: segure a mensagem → **Copiar texto**)."}]})
+        await dc("POST", f"/channels/{canal_id}/messages", corpo={"content": decifrar(key_row["valor_cifrado"]), "allowed_mentions": {"parse": []}})
+    if cfg:
+        partes = []
+        if cfg["instrucoes"]:
+            partes.append(f'📖 **Instruções**\n{cfg["instrucoes"]}')
+        if cfg["link_download"]:
+            partes.append(f'⬇️ **Download:** {cfg["link_download"]}')
+        if partes:
+            await dc("POST", f"/channels/{canal_id}/messages", corpo={
+                "embeds": [{"title": "📦 Como usar", "color": NEON, "description": "\n\n".join(partes)[:4096]}]})
+        if cfg["login_cifrado"]:
+            await dc("POST", f"/channels/{canal_id}/messages", corpo={
+                "embeds": [{"title": "🔐 Login de acesso", "color": NEON, "description": decifrar(cfg["login_cifrado"])[:4096]}]})
+    await dc("POST", f"/channels/{canal_id}/messages", corpo={
+        "content": "Já guardou tudo? Se quiser, você pode fechar este canal. Ele **não** é apagado sozinho.",
+        "components": [_linha(_botao("Já guardei, fechar canal", f"ecvd:fechar_entrega:{pid}", 2, "🔒"))]})
+    with _tx() as conn:
+        if key_row:
+            conn.execute("UPDATE keys SET status = 'entregue', entregue_em = ?, validade_dias = ?, expira_em = ? WHERE id = ?",
+                         (agora.isoformat(), p["dias"], expira.isoformat() if expira else None, key_row["id"]))
+        conn.execute("UPDATE pedidos SET status = ?, entregue_em = ?, fechar_pagamento_em = ? WHERE id = ?",
+                     (ENTREGUE, agora.isoformat(), (agora + APAGAR_PAGAMENTO_APOS_ENTREGA).isoformat(), pid))
+        _auditar(conn, "entregue", pid, None, f'canal {canal_id}' + (f' key {key_row["final"]}' if key_row else ""))
+    p = _pedido(pid)
+    await _editar_msg_pedido(p, _embed_pedido(p, extra=(f'✅ Pagamento aprovado por <@{p["aprovado_por"]}> em {_fmt(p["aprovado_em"])}.\n'
+                                                       f"📦 Entregue no canal privado <#{canal_id}>.")), [])
+    if p["canal_pagamento_id"] and not p["pagamento_apagado"]:
+        try:
+            await dc("POST", f'/channels/{p["canal_pagamento_id"]}/messages', corpo={
+                "content": (f"<@{uid}> ✅ Pagamento aprovado! Sua key foi entregue no canal privado <#{canal_id}>. "
+                            "Este canal de pagamento será apagado em 30 minutos."),
+                "allowed_mentions": {"parse": [], "users": [uid]}})
+        except ErroDiscord:
+            pass
+    await _dm(uid, {"title": "✅ Compra aprovada!", "color": NEON,
+                    "description": f'Seu pedido `{pid}` ({p["produto_nome"]} • {_rotulo_jogo(j)}) foi entregue no canal privado <#{canal_id}>.'})
+    await registrar_venda_log(
+        f'📦 Pedido `{pid}` **entregue** — {_rotulo_jogo(j)} • {p["produto_nome"]} • {_reais_c(p["preco_centavos"])} • '
+        f'<@{uid}> • aprovado por <@{p["aprovado_por"]}> • ' + (f'key {key_row["final"]} • ' if key_row else "")
+        + f'entrega <#{canal_id}> • {_fmt(agora)}')
+    _paineis_depois(2, jogo=p["jogo"])
+
+
+async def _vendas_reentregar(r: _Resposta, pid: str) -> None:
+    if not _eh_fundador(r.inter):
+        await r.efemera("⛔ Só o cargo **FUNDADOR** pode fazer isso.")
+        return
+    await r.adiar()
+    resultado = await entregar_pedido(pid)
+    textos = {"entregue": "✅ Entregue!", "sem estoque": "⚠️ Ainda sem keys para este plano. Use /key_adicionar.",
+              "nada a fazer": "Este pedido não está esperando entrega."}
+    await r.efemera(textos.get(resultado, f"⚠️ {resultado}"))
+
+
+async def _vendas_fechar_entrega(r: _Resposta, pid: str, confirmado: bool) -> None:
+    inter = r.inter
+    p = _pedido(pid)
+    if not p or str(inter.channel_id) != (p["canal_entrega_id"] or ""):
+        await r.efemera("Este canal já está sendo fechado.")
+        return
+    if str(inter.user.id) != p["usuario_id"] and not _eh_fundador(inter):
+        await r.efemera("Só quem comprou pode fechar este canal.")
+        return
+    if not confirmado:
+        await r.enviar(4, {"content": "Tem certeza? Ao fechar, a key e as instruções somem deste canal. Confira se você guardou tudo.",
+                           "flags": 64, "components": [_linha(_botao("Sim, fechar canal", f"ecvd:fechar_entrega_ok:{pid}", 4, "🔒"))]})
+        return
+    with _tx() as conn:
+        conn.execute("UPDATE pedidos SET fechar_entrega_em = ? WHERE id = ?", ((_agora() + timedelta(seconds=3)).isoformat(), pid))
+        _auditar(conn, "entrega_fechada", pid, str(inter.user.id))
+    await r.enviar(7, {"content": "🔒 Fechando o canal…", "components": []})
+
+
+async def rodar_vendas() -> None:
+    """Rotina (a cada 20 s): expira pedidos sem pagamento, apaga canais de pagamento encerrados, retoma entregas."""
+    if not _vendas["pronto"]:
+        if time.time() - _vendas.get("ultima_tentativa", 0) > 30 and _cfg_estado.get("carregada"):
+            _vendas["ultima_tentativa"] = time.time()
+            await iniciar_vendas()
+        return
+    agora = _agora()
+    limite = (agora - ESPERA_PAGAMENTO_VENDA).isoformat()
+    for p in _q("SELECT * FROM pedidos WHERE status = ? AND criado_em < ?", (AG_PAGAMENTO, limite)):
+        with _tx() as conn:
+            mudou = conn.execute("UPDATE pedidos SET status = ?, fechar_pagamento_em = ? WHERE id = ? AND status = ?",
+                                 (EXPIRADO, (agora + APAGAR_PAGAMENTO_APOS_EXPIRAR).isoformat(), p["id"], AG_PAGAMENTO)).rowcount
+            if mudou:
+                _auditar(conn, "expirado", p["id"])
+        if mudou and p["canal_pagamento_id"]:
+            try:
+                await dc("POST", f'/channels/{p["canal_pagamento_id"]}/messages', corpo={
+                    "content": f'<@{p["usuario_id"]}> ⌛ O pedido `{p["id"]}` expirou sem pagamento informado. Este canal será apagado.',
+                    "allowed_mentions": {"parse": [], "users": [p["usuario_id"]]}})
+            except ErroDiscord:
+                pass
+            _paineis_depois(2, jogo=p["jogo"])
+    for p in _q("SELECT * FROM pedidos WHERE pagamento_apagado = 0 AND fechar_pagamento_em IS NOT NULL AND fechar_pagamento_em <= ?",
+                (agora.isoformat(),)):
+        if p["canal_pagamento_id"]:
+            try:
+                await dc("DELETE", f'/channels/{p["canal_pagamento_id"]}', motivo=f'Pedido {p["id"]} encerrado')
+            except ErroDiscord as erro:
+                if erro.status != 404 and erro.codigo != 10003:
+                    log.warning("Não consegui apagar o canal de pagamento de %s: %s", p["id"], erro)
+                    continue
+        with _tx() as conn:
+            conn.execute("UPDATE pedidos SET pagamento_apagado = 1 WHERE id = ?", (p["id"],))
+    for p in _q("SELECT * FROM pedidos WHERE entrega_apagada = 0 AND fechar_entrega_em IS NOT NULL AND fechar_entrega_em <= ?",
+                (agora.isoformat(),)):
+        if p["canal_entrega_id"]:
+            try:
+                await dc("DELETE", f'/channels/{p["canal_entrega_id"]}', motivo=f'Entrega {p["id"]} fechada pelo comprador')
+            except ErroDiscord as erro:
+                if erro.status != 404 and erro.codigo != 10003:
+                    continue
+        with _tx() as conn:
+            conn.execute("UPDATE pedidos SET entrega_apagada = 1 WHERE id = ?", (p["id"],))
+    # retoma entregas: aprovados sem entrega (ex.: o bot reiniciou no meio) e pedidos esperando estoque
+    travados = (agora - timedelta(minutes=2)).isoformat()
+    for p in _q("SELECT id FROM pedidos WHERE status = ? OR (status = ? AND entregando_desde < ?) ORDER BY aprovado_em",
+                (APROVADO, ENTREGANDO, travados)):
+        if not _lock_pedido(p["id"]).locked():
+            await entregar_pedido(p["id"])
+    for p in _q("SELECT id, jogo, plano FROM pedidos WHERE status = ? ORDER BY aprovado_em", (AG_ESTOQUE,)):
+        if _estoque(p["jogo"], p["plano"])["disponiveis"] > 0 and not _lock_pedido(p["id"]).locked():
+            await entregar_pedido(p["id"])
+    await _rechecar_backup()
+
+
+# ── comandos de barra das vendas ──
+
+_ESCOLHAS_JOGO = [{"name": f"{n} • {pl}", "value": i} for i, n, pl, _, _ in JOGOS_PADRAO]
+_ESCOLHAS_PLANO = [{"name": n, "value": i} for i, n, _, _ in PLANOS_PADRAO]
+_OP_JOGO = {"type": 3, "name": "jogo", "description": "Jogo e plataforma", "required": True, "choices": _ESCOLHAS_JOGO}
+_OP_PLANO = {"type": 3, "name": "plano", "description": "Plano (duração da key)", "required": True, "choices": _ESCOLHAS_PLANO}
+
+
+def _opcional(op: dict, descricao: str | None = None) -> dict:
+    return {**op, "required": False, **({"description": descricao} if descricao else {})}
+
+
+COMANDOS_VENDAS: list[dict[str, Any]] = [
+    {"name": "produto_configurar", "description": "Configurar produto: jogo, plano, preço, duração e se está à venda", "type": 1,
+     "default_member_permissions": "8",
+     "options": [{**_OP_JOGO, "choices": _ESCOLHAS_JOGO + [{"name": "Todos os jogos", "value": "todos"}]}, _OP_PLANO,
+                 {"type": 10, "name": "preco", "description": "Preço em reais (ex.: 17.90)", "required": False, "min_value": 0.5, "max_value": 10000},
+                 {"type": 5, "name": "ativo", "description": "À venda?", "required": False},
+                 {"type": 4, "name": "dias", "description": "Duração em dias (0 = permanente)", "required": False, "min_value": 0, "max_value": 3650},
+                 {"type": 5, "name": "usa_keys", "description": "Entrega uma key do estoque? (não = só login/instruções)", "required": False},
+                 {"type": 3, "name": "nome", "description": "Nome exibido (ex.: Key 7 dias)", "required": False, "max_length": 60},
+                 {"type": 3, "name": "link_pagamento", "description": "Link de pagamento opcional (https://…) ou 'remover'", "required": False}]},
+    {"name": "key_adicionar", "description": "Cadastrar uma ou mais keys no estoque (ninguém vê além de você)", "type": 1,
+     "default_member_permissions": "8",
+     "options": [_OP_JOGO, _OP_PLANO,
+                 {"type": 3, "name": "keys", "description": "Keys separadas por espaço, vírgula ou linha", "required": False, "max_length": 6000},
+                 {"type": 11, "name": "arquivo", "description": "Arquivo .txt com uma key por linha", "required": False}]},
+    {"name": "key_estoque", "description": "Consultar o estoque de keys por jogo e plano", "type": 1, "default_member_permissions": "8",
+     "options": [_opcional(_OP_JOGO), _opcional(_OP_PLANO)]},
+    {"name": "key_consultar", "description": "Consultar uma key (ou a key de um pedido)", "type": 1, "default_member_permissions": "8",
+     "options": [{"type": 3, "name": "key", "description": "A key", "required": False},
+                 {"type": 3, "name": "pedido", "description": "ID do pedido (ECO-…)", "required": False, "autocomplete": True},
+                 {"type": 5, "name": "mostrar_completa", "description": "Mostrar a key inteira (só para você)", "required": False}]},
+    {"name": "key_revogar", "description": "Revogar uma key (tira do estoque ou marca a entregue como revogada)", "type": 1,
+     "default_member_permissions": "8",
+     "options": [{"type": 3, "name": "motivo", "description": "Motivo", "required": True, "max_length": 200},
+                 {"type": 3, "name": "key", "description": "A key", "required": False},
+                 {"type": 3, "name": "pedido", "description": "ID do pedido (ECO-…)", "required": False, "autocomplete": True}]},
+    {"name": "entrega_configurar", "description": "Cadastrar login e instruções enviados junto com a key", "type": 1,
+     "default_member_permissions": "8",
+     "options": [_OP_JOGO, _opcional(_OP_PLANO, "Plano (vazio = vale para todos os planos do jogo)")]},
+    {"name": "pedido_consultar", "description": "Consultar um pedido", "type": 1, "default_member_permissions": "8",
+     "options": [{"type": 3, "name": "pedido", "description": "ID do pedido (ECO-…)", "required": True, "autocomplete": True}]},
+    {"name": "painel_vendas_publicar", "description": "Publicar ou atualizar os cinco painéis de venda", "type": 1,
+     "default_member_permissions": "8"},
+    {"name": "painel_vendas_atualizar", "description": "Atualizar preços, planos e textos dos painéis de venda", "type": 1,
+     "default_member_permissions": "8",
+     "options": [_opcional(_OP_PLANO, "Plano para mudar (em todos os jogos, ou só no jogo escolhido)"),
+                 {"type": 10, "name": "preco", "description": "Novo preço em reais (ex.: 17.90)", "required": False, "min_value": 0.5, "max_value": 10000},
+                 {"type": 5, "name": "ativo", "description": "Plano à venda?", "required": False},
+                 _opcional({**_OP_JOGO, "choices": _ESCOLHAS_JOGO}, "Só este jogo (vazio = todos)"),
+                 {"type": 3, "name": "descricao", "description": "Texto de apresentação do painel ('padrao' volta ao original)", "required": False, "max_length": 1500},
+                 {"type": 11, "name": "imagem", "description": "Imagem/banner do painel", "required": False}]},
+]
+_NOMES_VENDAS = {c["name"] for c in COMANDOS_VENDAS}
+COMANDOS.extend(COMANDOS_VENDAS)
+_NOMES_COMANDOS.update(_NOMES_VENDAS)
+
+
+def _achar_key(texto: str | None, pedido: str | None) -> sqlite3.Row | None:
+    if texto and texto.strip():
+        return _q1("SELECT * FROM keys WHERE hash = ?", (_hash_key(texto.strip()),))
+    if pedido:
+        p = _pedido(pedido.strip().upper())
+        if p and p["key_id"]:
+            return _q1("SELECT * FROM keys WHERE id = ?", (p["key_id"],))
+        return _q1("SELECT * FROM keys WHERE pedido_id = ? ORDER BY id DESC", (pedido.strip().upper(),))
+    return None
+
+
+def _ler_keys(texto: str) -> list[str]:
+    return [k for k in (x.strip() for x in re.split(r"[\s,;]+", texto or "")) if 3 <= len(k) <= 300]
+
+
+def _embed_estoque(jogo: str | None, plano: str | None) -> dict:
+    linhas = []
+    for j in _q("SELECT * FROM jogos ORDER BY ordem"):
+        if jogo and j["id"] != jogo:
+            continue
+        linhas.append(f'**{j["emoji"] or "🎮"} {_rotulo_jogo(j)}**')
+        for pr in sorted(_q("SELECT * FROM produtos WHERE jogo = ?", (j["id"],)), key=lambda x: _ORDEM_PLANOS.get(x["plano"], 99)):
+            if plano and pr["plano"] != plano:
+                continue
+            cont = {row["status"]: row["n"] for row in _q("SELECT status, COUNT(*) n FROM keys WHERE jogo = ? AND plano = ? GROUP BY status",
+                                                          (j["id"], pr["plano"]))}
+            est = _estoque(j["id"], pr["plano"])
+            situacao = "" if pr["ativo"] else " • ⏸️ fora de venda"
+            if not pr["usa_keys"]:
+                situacao += " • entrega sem key"
+            linhas.append(f'`{pr["nome"]:<15}` 🟢 {cont.get("disponivel", 0)} disp. • ⏳ {est["em_aberto"]} em pedidos • '
+                          f'📦 {cont.get("entregue", 0)} entregues • ⛔ {cont.get("revogada", 0)} revogadas{situacao}')
+        linhas.append("")
+    return {"title": "🔑 Estoque de keys", "description": "\n".join(linhas)[:4096] or "Nada encontrado.", "color": NEON,
+            "footer": {"text": "'disp.' = no cofre • 'em pedidos' = já prometidas a pedidos em andamento"}}
+
+
+def _embed_pedido_admin(p: sqlite3.Row) -> dict:
+    j = _jogo(p["jogo"])
+    k = _q1("SELECT final, status, expira_em FROM keys WHERE id = ?", (p["key_id"],)) if p["key_id"] else None
+    linhas = [f'**Cliente:** <@{p["usuario_id"]}> ({p["usuario_nome"]})',
+              f'**Produto:** {_rotulo_jogo(j)} • {p["produto_nome"]} • {_duracao(p["dias"])} • {_reais_c(p["preco_centavos"])}',
+              f'**Status:** {ROTULO_STATUS.get(p["status"], p["status"])}',
+              f'**Criado:** {_fmt(p["criado_em"])}']
+    if p["pagador_cifrado"]:
+        linhas.append(f'**Pagador:** {decifrar(p["pagador_cifrado"])} • informado {_fmt(p["informado_em"])}')
+    if p["aprovado_por"]:
+        linhas.append(f'**Aprovado por:** <@{p["aprovado_por"]}> em {_fmt(p["aprovado_em"])}')
+    if p["rejeitado_por"]:
+        linhas.append(f'**Rejeitado por:** <@{p["rejeitado_por"]}> em {_fmt(p["rejeitado_em"])} • motivo: {p["motivo_rejeicao"]}')
+    if p["entregue_em"]:
+        linhas.append(f'**Entregue:** {_fmt(p["entregue_em"])}' + (f' • canal <#{p["canal_entrega_id"]}>' if p["canal_entrega_id"] else ""))
+    if k:
+        linhas.append(f'**Key:** {k["final"]} ({k["status"]})' + (f' • validade até {_fmt(k["expira_em"])} (informativo)' if k["expira_em"] else ""))
+    if p["canal_pagamento_id"] and not p["pagamento_apagado"]:
+        linhas.append(f'**Canal de pagamento:** <#{p["canal_pagamento_id"]}>')
+    eventos = _q("SELECT * FROM auditoria WHERE pedido_id = ? ORDER BY id DESC LIMIT 8", (p["id"],))
+    if eventos:
+        linhas.append("\n**Histórico**")
+        linhas += [f'• {_fmt(e["quando"])} — {e["acao"]}' + (f' por <@{e["ator_id"]}>' if e["ator_id"] else "") for e in reversed(eventos)]
+    return {"title": f'🧾 Pedido {p["id"]}', "description": "\n".join(linhas)[:4096], "color": NEON}
+
+
+def _embed_pendentes_vendas() -> dict:
+    ordem = [AG_CONFERENCIA, AG_ESTOQUE, APROVADO, ENTREGANDO, AG_PAGAMENTO]
+    linhas = []
+    for st in ordem:
+        for p in _q("SELECT * FROM pedidos WHERE status = ? ORDER BY criado_em", (st,))[:15]:
+            j = _jogo(p["jogo"])
+            canal = f' • <#{p["canal_pagamento_id"]}>' if p["canal_pagamento_id"] and not p["pagamento_apagado"] else ""
+            linhas.append(f'**`{p["id"]}`** • {_rotulo_jogo(j)} • {p["produto_nome"]} • {_reais_c(p["preco_centavos"])}\n'
+                          f'{ROTULO_STATUS[st]} • <@{p["usuario_id"]}>{canal} • {_fmt(p["informado_em"] or p["criado_em"])}')
+    if not linhas:
+        return {"title": "🎮 Vendas de keys • pendentes", "description": "Nenhum pedido pendente.", "color": NEON}
+    return {"title": "🎮 Vendas de keys • pendentes", "description": "\n\n".join(linhas)[:4096], "color": CORES["amarelo"],
+            "footer": {"text": "Aprove ou rejeite pelos botões na mensagem do pedido (só FUNDADOR)"}}
+
+
+async def _baixar_anexo_comando(dados: dict, nome_opcao: str) -> tuple[bytes, str] | None:
+    valor = next((o.get("value") for o in dados.get("options", []) if o["name"] == nome_opcao), None)
+    if not valor:
+        return None
+    anexo = ((dados.get("resolved") or {}).get("attachments") or {}).get(str(valor))
+    if not anexo:
+        return None
+    if anexo.get("size", 0) > 2_000_000:
+        raise ErroDiscord("Arquivo grande demais (máximo 2 MB).")
+    resp = await cliente_web().get(anexo["url"])
+    resp.raise_for_status()
+    return resp.content, anexo.get("filename", "arquivo")
+
+
+async def ao_comando_vendas(r: _Resposta, nome: str, op: dict, dados: dict) -> None:
+    inter = r.inter
+    if nome == "entrega_configurar":  # abre um formulário (precisa responder na hora)
+        if not _vendas["pronto"]:
+            await r.efemera("O sistema de vendas está iniciando. Tente de novo em alguns segundos.")
+            return
+        if not _eh_fundador(inter):
+            await r.efemera("⛔ Só o cargo **FUNDADOR** pode usar este comando.")
+            return
+        jid, plano = op["jogo"], op.get("plano") or "*"
+        j = _jogo(jid)
+        atual = _q1("SELECT * FROM entregas_config WHERE jogo = ? AND plano = ?", (jid, plano))
+        campo = lambda cid, rotulo, estilo, maximo, valor, ph: {
+            "type": 1, "components": [{"type": 4, "custom_id": cid, "style": estilo, "label": rotulo, "max_length": maximo,
+                                       "required": False, "placeholder": ph, **({"value": valor} if valor else {})}]}
+        alvo = "todos os planos" if plano == "*" else _produto(jid, plano)["nome"]
+        await r.enviar(9, {"custom_id": f"ecvd:m_entrega:{jid}:{plano}", "title": f'Entrega • {j["nome"]} {j["plataforma"]}'[:45],
+                           "components": [
+                               campo("instrucoes", f"Instruções ({alvo})"[:45], 2, 1500, atual["instrucoes"] if atual else None,
+                                     "Passo a passo para usar a key"),
+                               campo("login", "Login / acesso (fica cifrado)", 2, 1000,
+                                     decifrar(atual["login_cifrado"]) if atual and atual["login_cifrado"] else None, "Opcional"),
+                               campo("link", "Link de download", 1, 300, atual["link_download"] if atual else None, "https://… (opcional)")]})
+        return
+    await r.adiar()
+    if not _vendas["pronto"]:
+        await r.efemera("O sistema de vendas está iniciando. Tente de novo em alguns segundos.")
+        return
+    if not _eh_fundador(inter):
+        await r.efemera("⛔ Só o cargo **FUNDADOR** pode usar os comandos de vendas.")
+        return
+    quem = str(inter.user.id)
+
+    if nome == "produto_configurar":
+        jogos = [x[0] for x in JOGOS_PADRAO] if op["jogo"] == "todos" else [op["jogo"]]
+        mudancas = []
+        with _tx() as conn:
+            for jid in jogos:
+                _produto(jid, op["plano"])
+                sets, args = [], []
+                if op.get("preco") is not None:
+                    sets.append("preco_centavos = ?"); args.append(int(round(float(op["preco"]) * 100)))
+                if op.get("ativo") is not None:
+                    sets.append("ativo = ?"); args.append(1 if op["ativo"] else 0)
+                if op.get("dias") is not None:
+                    sets.append("dias = ?"); args.append(int(op["dias"]) or None)
+                if op.get("usa_keys") is not None:
+                    sets.append("usa_keys = ?"); args.append(1 if op["usa_keys"] else 0)
+                if op.get("nome"):
+                    sets.append("nome = ?"); args.append(op["nome"].strip()[:60])
+                if op.get("link_pagamento"):
+                    link = op["link_pagamento"].strip()
+                    if _norm(link) == "remover":
+                        link = None
+                    elif not re.match(r"https://", link):
+                        raise ErroDiscord("O link de pagamento precisa começar com https://")
+                    sets.append("link_pagamento = ?"); args.append(link)
+                if sets:
+                    conn.execute(f"UPDATE produtos SET {', '.join(sets)}, atualizado_em = ? WHERE jogo = ? AND plano = ?",
+                                 (*args, _agora_iso(), jid, op["plano"]))
+                    _auditar(conn, "produto_configurado", None, quem, f'{jid}/{op["plano"]}: {", ".join(sets)}')
+                mudancas.append(jid)
+        linhas = []
+        for jid in jogos:
+            pr, j = _produto(jid, op["plano"]), _jogo(jid)
+            linhas.append(f'• {_rotulo_jogo(j)} • **{pr["nome"]}** • {_reais_c(pr["preco_centavos"])} • {_duracao(pr["dias"])} • '
+                          f'{"à venda" if pr["ativo"] else "fora de venda"} • {"key do estoque" if pr["usa_keys"] else "sem key (só login/instruções)"}')
+        _paineis_depois(1)
+        await r.efemera("✅ Produto configurado. Os painéis serão atualizados em instantes.\n" + "\n".join(linhas))
+
+    elif nome == "key_adicionar":
+        bruto = op.get("keys") or ""
+        arq = await _baixar_anexo_comando(dados, "arquivo")
+        if arq:
+            bruto += "\n" + arq[0].decode("utf-8", "ignore")
+        keys = _ler_keys(bruto)
+        if not keys:
+            await r.efemera("Nenhuma key encontrada. Mande em **keys** (separadas por espaço, vírgula ou linha) ou em um arquivo .txt.")
+            return
+        if len(keys) > 1000:
+            await r.efemera("Mande no máximo 1000 keys por vez.")
+            return
+        jid, plano = op["jogo"], op["plano"]
+        j, pr = _jogo(jid), _produto(jid, plano)
+        novas = repetidas = 0
+        with _tx() as conn:
+            for k in dict.fromkeys(keys):
+                cur = conn.execute("INSERT OR IGNORE INTO keys (jogo, plano, valor_cifrado, hash, final, adicionada_por, adicionada_em) "
+                                   "VALUES (?, ?, ?, ?, ?, ?, ?)", (jid, plano, cifrar(k), _hash_key(k), _mascarar(k), quem, _agora_iso()))
+                if cur.rowcount:
+                    novas += 1
+                else:
+                    repetidas += 1
+            repetidas += len(keys) - len(dict.fromkeys(keys))
+            _auditar(conn, "keys_adicionadas", None, quem, f"{jid}/{plano}: {novas}")
+        est = _estoque(jid, plano)
+        await r.efemera(f'✅ **{novas}** key(s) adicionada(s) em {_rotulo_jogo(j)} • {pr["nome"]}.'
+                        + (f"\n⚠️ {repetidas} repetida(s) ignorada(s) (já estavam no cofre)." if repetidas else "")
+                        + f'\nEstoque agora: **{est["disponiveis"]}** no cofre • {est["livre"]} livres para novos pedidos.')
+        await registrar_venda_log(f'🔑 <@{quem}> adicionou {novas} key(s) em {_rotulo_jogo(j)} • {pr["nome"]}.')
+        for p in _q("SELECT id FROM pedidos WHERE status = ? AND jogo = ? AND plano = ? ORDER BY aprovado_em", (AG_ESTOQUE, jid, plano)):
+            asyncio.create_task(entregar_pedido(p["id"]))
+        _paineis_depois(2, jogo=jid)
+
+    elif nome == "key_estoque":
+        await r.editar_original({"embeds": [_embed_estoque(op.get("jogo"), op.get("plano"))], "allowed_mentions": {"parse": []}})
+        r.adiada = False
+
+    elif nome == "key_consultar":
+        k = _achar_key(op.get("key"), op.get("pedido"))
+        if not k:
+            await r.efemera("Key não encontrada no cofre.")
+            return
+        j = _jogo(k["jogo"])
+        valor = decifrar(k["valor_cifrado"]) if op.get("mostrar_completa") else k["final"]
+        linhas = [f'**Key:** `{valor}`', f'**Jogo/plano:** {_rotulo_jogo(j)} • {_produto(k["jogo"], k["plano"])["nome"]}',
+                  f'**Status:** {k["status"]}', f'**Cadastrada:** {_fmt(k["adicionada_em"])} por <@{k["adicionada_por"]}>']
+        if k["pedido_id"]:
+            p = _pedido(k["pedido_id"])
+            linhas.append(f'**Pedido:** `{k["pedido_id"]}`' + (f' • cliente <@{p["usuario_id"]}>' if p else ""))
+        if k["entregue_em"]:
+            linhas.append(f'**Entregue:** {_fmt(k["entregue_em"])} • validade {_duracao(k["validade_dias"])}'
+                          + (f' • até {_fmt(k["expira_em"])} (informativo: o bot não controla o programa)' if k["expira_em"] else ""))
+        if k["revogada_em"]:
+            linhas.append(f'**Revogada:** {_fmt(k["revogada_em"])} por <@{k["revogada_por"]}> • {k["motivo_revogacao"]}')
+        await r.editar_original({"embeds": [{"title": "🔑 Consulta de key", "description": "\n".join(linhas), "color": NEON}],
+                                 "allowed_mentions": {"parse": []}})
+        r.adiada = False
+
+    elif nome == "key_revogar":
+        k = _achar_key(op.get("key"), op.get("pedido"))
+        if not k:
+            await r.efemera("Key não encontrada no cofre. Informe a key ou o pedido.")
+            return
+        if k["status"] == "revogada":
+            await r.efemera("Esta key já está revogada.")
+            return
+        with _tx() as conn:
+            conn.execute("UPDATE keys SET status = 'revogada', revogada_por = ?, revogada_em = ?, motivo_revogacao = ?, "
+                         "pedido_id = CASE WHEN status = 'reservada' THEN NULL ELSE pedido_id END WHERE id = ?",
+                         (quem, _agora_iso(), op["motivo"][:200], k["id"]))
+            if k["status"] == "reservada" and k["pedido_id"]:
+                conn.execute("UPDATE pedidos SET key_id = NULL WHERE id = ? AND status != ?", (k["pedido_id"], ENTREGUE))
+            _auditar(conn, "key_revogada", k["pedido_id"], quem, f'{k["final"]} ({k["status"]}): {op["motivo"][:150]}')
+        extra = ""
+        if k["status"] == "entregue":
+            extra = ("\nℹ️ Ela já tinha sido entregue: a revogação fica registrada aqui, mas o bot **não** desativa a key no programa. "
+                     "Se o seu sistema de licenças tiver painel próprio, desative lá também.")
+        elif k["status"] == "reservada":
+            extra = "\nℹ️ Ela estava reservada para um pedido em entrega; o pedido vai receber outra key do estoque."
+        await r.efemera(f'⛔ Key {k["final"]} revogada.{extra}')
+        await registrar_venda_log(f'⛔ <@{quem}> revogou a key {k["final"]} ({k["jogo"]}/{k["plano"]}). Motivo: {op["motivo"][:150]}')
+        _paineis_depois(2)
+
+    elif nome == "pedido_consultar":
+        p = _pedido(str(op.get("pedido") or "").strip().upper())
+        if not p:
+            await r.efemera("Pedido não encontrado.")
+            return
+        await r.editar_original({"embeds": [_embed_pedido_admin(p)], "allowed_mentions": {"parse": []}})
+        r.adiada = False
+
+    elif nome == "painel_vendas_publicar":
+        resultado = await sincronizar_paineis(criar=True)
+        await r.efemera("📢 **Painéis de venda**\n" + "\n".join(f"• {x}" for x in resultado))
+
+    elif nome == "painel_vendas_atualizar":
+        jogos = [op["jogo"]] if op.get("jogo") else [x[0] for x in JOGOS_PADRAO]
+        img = await _baixar_anexo_comando(dados, "imagem")
+        url_img = None
+        if img:
+            url_img = await _guardar_imagem_bytes(img[0], img[1])
+        with _tx() as conn:
+            for jid in jogos:
+                if op.get("plano"):
+                    sets, args = [], []
+                    if op.get("preco") is not None:
+                        sets.append("preco_centavos = ?"); args.append(int(round(float(op["preco"]) * 100)))
+                    if op.get("ativo") is not None:
+                        sets.append("ativo = ?"); args.append(1 if op["ativo"] else 0)
+                    if sets:
+                        conn.execute(f"UPDATE produtos SET {', '.join(sets)}, atualizado_em = ? WHERE jogo = ? AND plano = ?",
+                                     (*args, _agora_iso(), jid, op["plano"]))
+                if op.get("descricao"):
+                    conn.execute("UPDATE jogos SET descricao = ? WHERE id = ?",
+                                 (None if _norm(op["descricao"]) == "padrao" else op["descricao"].strip(), jid))
+                if url_img:
+                    conn.execute("UPDATE jogos SET imagem_url = ? WHERE id = ?", (url_img, jid))
+            _auditar(conn, "paineis_atualizados", None, quem, json.dumps({k: v for k, v in op.items() if k != "imagem"})[:300])
+        resultado = await sincronizar_paineis(criar=False)
+        await r.efemera("✅ Painéis atualizados:\n" + "\n".join(f"• {x}" for x in resultado))
+
+
+async def _guardar_imagem_bytes(conteudo: bytes, nome: str) -> str:
+    canal = _cfg_estado.get("canal_id") or await _canal_config()
+    nome = re.sub(r"[^A-Za-z0-9._-]+", "_", nome)[-60:] or "imagem.png"
+    msg = await dc("POST", f"/channels/{canal}/messages",
+                   dados={"payload_json": json.dumps({"content": "🖼️ Imagem de painel de vendas. Não apague.",
+                                                      "attachments": [{"id": 0, "filename": nome}]})},
+                   arquivos={"files[0]": (nome, conteudo, "application/octet-stream")})
+    return msg["attachments"][0]["url"].split("?")[0]
+
+
+async def _vendas_modal_entrega(r: _Resposta, jid: str, plano: str) -> None:
+    inter = r.inter
+    if not _eh_fundador(inter):
+        await r.efemera("⛔ Só o cargo **FUNDADOR** pode configurar a entrega.")
+        return
+    instr = (_valor_modal(inter.data, "instrucoes") or "").strip()
+    login = (_valor_modal(inter.data, "login") or "").strip()
+    link = (_valor_modal(inter.data, "link") or "").strip()
+    if link and not re.match(r"https?://", link):
+        await r.efemera("O link de download precisa começar com https://")
+        return
+    with _tx() as conn:
+        conn.execute("INSERT INTO entregas_config (jogo, plano, instrucoes, login_cifrado, link_download, atualizado_por, atualizado_em) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (jogo, plano) DO UPDATE SET instrucoes = excluded.instrucoes, "
+                     "login_cifrado = excluded.login_cifrado, link_download = excluded.link_download, "
+                     "atualizado_por = excluded.atualizado_por, atualizado_em = excluded.atualizado_em",
+                     (jid, plano, instr or None, cifrar(login) if login else None, link or None, str(inter.user.id), _agora_iso()))
+        _auditar(conn, "entrega_configurada", None, str(inter.user.id), f"{jid}/{plano}")
+    j = _jogo(jid)
+    alvo = "todos os planos" if plano == "*" else _produto(jid, plano)["nome"]
+    await r.efemera(f'✅ Entrega de {_rotulo_jogo(j)} ({alvo}) salva: '
+                    + ", ".join(x for x, v in (("instruções", instr), ("login (cifrado)", login), ("link de download", link)) if v)
+                    or "nada preenchido (a entrega vai só com a key)")
+
+
+async def _autocompletar_vendas(r: _Resposta, nome: str, dados: dict) -> None:
+    foco = next((o for o in dados.get("options", []) if o.get("focused")), {})
+    texto = _norm(foco.get("value") or "")
+    escolhas = []
+    if _vendas["pronto"] and _eh_fundador(r.inter):
+        for p in _q("SELECT * FROM pedidos ORDER BY criado_em DESC LIMIT 200"):
+            rotulo = f'{p["id"]} • {p["produto_nome"]} • {p["jogo"]} • {p["usuario_nome"] or ""} • {p["status"]}'
+            if not texto or texto in _norm(rotulo):
+                escolhas.append({"name": rotulo[:100], "value": p["id"]})
+            if len(escolhas) >= 25:
+                break
+    await r.enviar(8, {"choices": escolhas})
+
+
+async def ao_clique_vendas(r: _Resposta, tipo: int, partes: list[str], dados: dict) -> None:
+    acao = partes[1] if len(partes) > 1 else ""
+    alvo = partes[2] if len(partes) > 2 else ""
+    if not _vendas["pronto"]:
+        if acao == "menu":
+            await r.enviar(6)
+        await r.efemera("O sistema de vendas está iniciando. Tente de novo em alguns segundos.")
+        return
+    if tipo == 5:
+        if acao == "m_pagador":
+            await _vendas_modal_pagador(r, alvo)
+        elif acao == "m_aprovar":
+            await _vendas_modal_aprovar(r, alvo)
+        elif acao == "m_rejeitar":
+            await _vendas_modal_rejeitar(r, alvo)
+        elif acao == "m_entrega":
+            await _vendas_modal_entrega(r, alvo, partes[3] if len(partes) > 3 else "*")
+        return
+    if acao == "menu":
+        valores = dados.get("values") or []
+        await _vendas_menu(r, alvo, valores[0] if valores else "")
+    elif acao == "pagar":
+        await _vendas_pagar(r, alvo)
+    elif acao in ("cancelar", "cancelar_ok"):
+        await _vendas_cancelar(r, alvo, acao == "cancelar_ok")
+    elif acao in ("aprovar", "rejeitar"):
+        await _vendas_pedir_aprovacao(r, alvo, acao == "aprovar")
+    elif acao == "reentregar":
+        await _vendas_reentregar(r, alvo)
+    elif acao in ("fechar_entrega", "fechar_entrega_ok"):
+        await _vendas_fechar_entrega(r, alvo, acao == "fechar_entrega_ok")
+
+
+def resumo_vendas_status() -> dict:
+    if not _vendas["pronto"]:
+        return {"pronto": False, "aviso": _vendas["aviso"]}
+    return {
+        "pronto": True,
+        "paineis": {j["id"]: (f'publicado (mensagem {j["mensagem_id"]})' if j["mensagem_id"] else "não publicado")
+                    for j in _q("SELECT * FROM jogos ORDER BY ordem")},
+        "keys_no_cofre": _q1("SELECT COUNT(*) n FROM keys WHERE status = 'disponivel'")["n"],
+        "pedidos_abertos": _q1(f"SELECT COUNT(*) n FROM pedidos WHERE status IN ({','.join('?' * len(STATUS_ABERTOS_VENDA))})",
+                               STATUS_ABERTOS_VENDA)["n"],
+        "aguardando_conferencia": _q1("SELECT COUNT(*) n FROM pedidos WHERE status = ?", (AG_CONFERENCIA,))["n"],
+        "entregues": _q1("SELECT COUNT(*) n FROM pedidos WHERE status = ?", (ENTREGUE,))["n"],
+        "cargo_fundador": _cfg_vendas("cargo_fundador_id") or "NÃO CONFIGURADO",
+        "chave_cofre": "configurada" if _env("CHAVE_COFRE") else "derivada do token (configure CHAVE_COFRE)",
+        "ultimo_backup": _vendas["backup_msg"] or _vendas["restaurado"],
+    }
+
+
+@mcp.tool(annotations=LEITURA)
+async def vendas_status() -> dict:
+    """Situação das vendas automáticas de keys: painéis, estoque, pedidos abertos e configuração (sem mostrar keys)."""
+    res = resumo_vendas_status()
+    if res.get("pronto"):
+        res["estoque"] = {f'{x["jogo"]}/{x["plano"]}': x["n"] for x in
+                          _q("SELECT jogo, plano, COUNT(*) n FROM keys WHERE status = 'disponivel' GROUP BY jogo, plano")}
+        res["precos"] = {f'{x["jogo"]}/{x["plano"]}': f'{_reais_c(x["preco_centavos"])}{"" if x["ativo"] else " (fora de venda)"}'
+                         for x in _q("SELECT * FROM produtos ORDER BY jogo")}
+    return res
+
+
+@mcp.tool()
+async def vendas_publicar_paineis() -> dict:
+    """Publica (ou atualiza, sem duplicar) os cinco painéis de venda de keys nos canais dos jogos."""
+    if not _vendas["pronto"]:
+        await iniciar_vendas()
+    if not _vendas["pronto"]:
+        raise ErroDiscord(f'Vendas ainda iniciando: {_vendas["aviso"]}')
+    return {"paineis": await sincronizar_paineis(criar=True)}
 
 
 # ───────────────────────── app web ─────────────────────────
@@ -4318,6 +6023,13 @@ async def ciclo_de_vida(app):
             for t in tarefas:
                 t.cancel()
             await _salvar_pendente()
+            if _vendas.get("pronto") and (_vendas.get("sujo") or (_tarefa_backup and not _tarefa_backup.done())):
+                if _tarefa_backup and not _tarefa_backup.done():
+                    _tarefa_backup.cancel()
+                try:
+                    await backup_vendas("desligamento")
+                except Exception:
+                    log.exception("Backup de desligamento falhou")
             if _bot is not None:
                 try:
                     await _bot.close()

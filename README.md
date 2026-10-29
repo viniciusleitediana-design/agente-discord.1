@@ -21,12 +21,25 @@ As automações e as compras em andamento ficam salvas no canal privado `#agente
 - Conteúdo fixo (`conteudo_fixo=true`): a mensagem mais recente do canal vai para todos os compradores e não é apagada
 - Chats sem pagamento informado fecham sozinhos em 24 h; depois da entrega, fecham em 5 min
 
+### Vendas automáticas de keys (ECO CHEATS)
+
+- **Painéis**: 1 por canal de jogo (pelos IDs dos canais): CS2, Roblox Emulador, Roblox Mobile, Free Fire Emulador, Free Fire Mobile. Menu com Key 1 dia (R$ 3,90), 7 dias (R$ 17,90), 15 dias (R$ 32,90), 30 dias (R$ 54,90) e permanente (R$ 99,00), com preço e estoque. Os IDs das mensagens ficam no banco: reiniciar só atualiza, nunca duplica.
+- **Compra**: escolher no menu → pedido no SQLite (`ECO-XXXXXXXX`) → canal privado `venda-painel-[jogo]-[nome]` (cliente, bot e FUNDADOR) com QR Code, Pix copia e cola do valor exato, link opcional e os botões CONFIRMAR PAGAMENTO / CANCELAR PEDIDO.
+- **Pagamento**: CONFIRMAR PAGAMENTO abre formulário com o nome completo do pagador → AGUARDANDO_CONFERENCIA → o FUNDADOR é avisado e vê APROVAR / REJEITAR.
+- **Aprovação**: só o cargo FUNDADOR (checado no servidor em todo clique e formulário). Aprovar exige digitar CONFIRMO; fica registrado quem e quando; nunca aprova nem entrega duas vezes. Rejeitar pede o motivo e avisa o cliente.
+- **Entrega**: NOVO canal privado `entrega-[jogo]-[nome]` com a key (do cofre), instruções, login e link configurados. Sem key no estoque: o pedido fica AGUARDANDO_ESTOQUE, o FUNDADOR é avisado e a entrega sai sozinha quando keys forem adicionadas. Canais de entrega não são apagados automaticamente.
+- **Comandos** (só FUNDADOR): `/produto_configurar`, `/key_adicionar`, `/key_estoque`, `/key_consultar`, `/key_revogar`, `/entrega_configurar`, `/pedido_consultar`, `/pedidos_pendentes`, `/painel_vendas_publicar`, `/painel_vendas_atualizar`.
+- **Segurança**: SQLite com transações; keys, logins e nomes de pagadores cifrados (variável `CHAVE_COFRE`, não troque depois de cadastrar keys); auditoria de cada passo; pedidos sem pagamento expiram em 24 h; canais de pagamento encerrados são apagados com atraso controlado.
+- **Persistência**: o disco do Render é apagado a cada deploy, então o banco é copiado para o canal privado `🗄️・backups-bot` depois de cada alteração (últimas 10 cópias) e restaurado ao ligar. Não apague esse canal.
+- **Validade**: o bot não ativa nem desativa keys no programa; a validade é só informação administrativa.
+
 ## Render
 
 - Build: `pip install -r requirements.txt`
 - Start: `python server.py`
 - Variáveis: `DISCORD_TOKEN` (obrigatória), `GUILD_ID`, `CHAVE_SECRETA`, `FUSO`, `MANTER_ACORDADO` (opcionais; detalhes no topo do `server.py`)
-- Loja: `PIX_CHAVE` (a chave Pix que recebe), `PIX_NOME` e `PIX_CIDADE` (opcionais)
+- Loja: `PIX_CHAVE` (a chave Pix que recebe), `PIX_NOME` e `PIX_CIDADE` (opcionais), `PIX_LINK` (link de pagamento opcional)
+- Vendas: `CHAVE_COFRE` (chave Fernet que cifra keys, logins e nomes; não troque depois de usar)
 
 ## Discord
 
