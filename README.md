@@ -18,7 +18,8 @@ As automações e as compras em andamento ficam salvas no canal privado `#agente
 
 - Ferramentas do conector: `configurar_produto`, `publicar_painel_compra`, `ver_loja`
 - Estoque: cada mensagem no canal de estoque do produto = 1 entrega (a mais antiga sai primeiro; mensagens fixadas são ignoradas)
-- Chats sem pagamento informado fecham sozinhos em 24 h; depois da entrega por DM, fecham em 5 min
+- Conteúdo fixo (`conteudo_fixo=true`): a mensagem mais recente do canal vai para todos os compradores e não é apagada
+- Chats sem pagamento informado fecham sozinhos em 24 h; depois da entrega, fecham em 5 min
 
 ## Render
 

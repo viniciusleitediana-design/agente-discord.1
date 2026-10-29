@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "2.4"
+VERSAO = "2.5"
 INICIO = time.time()
 
 
@@ -1348,6 +1348,10 @@ async def _pegar_item(prod: dict) -> tuple[str | None, tuple[str, str] | None]:
     if canal:
         msgs = await dc("GET", f"/channels/{canal}/messages", params={"limit": 100})
         validas = [m for m in msgs if not m.get("pinned") and (m.get("content") or m.get("attachments"))]
+        if validas and prod.get("conteudo_fixo"):
+            m = validas[0]  # conteúdo fixo: a mensagem mais recente, igual para todos e nunca apagada
+            partes = [m.get("content") or ""] + [a["url"] for a in m.get("attachments", [])]
+            return "\n".join(p for p in partes if p).strip(), None
         if validas:
             m = validas[-1]  # a API devolve da mais nova para a mais antiga
             partes = [m.get("content") or ""] + [a["url"] for a in m.get("attachments", [])]
@@ -1363,6 +1367,8 @@ async def _contar_estoque(prod: dict) -> str:
     except ErroDiscord as erro:
         return f"erro: {erro}"
     n = len([m for m in msgs if not m.get("pinned") and (m.get("content") or m.get("attachments"))])
+    if prod.get("conteudo_fixo"):
+        return "conteúdo fixo pronto (ilimitado)" if n else "VAZIO: mande o conteúdo no canal"
     return "100 ou mais" if n >= 100 else str(n)
 
 
@@ -1526,12 +1532,13 @@ async def _aprovar(r: _Resposta, canal: str, c: dict, prod: dict, quem: str, emb
             c["status"] = "analise"
             await r.editar_original({"embeds": [_com_rodape(embed, "⚠️ Sem produto para entregar: abasteça e clique em Confirmar de novo")],
                                      "components": [_botoes_decisao()]})
-            onde = (f'Mande o produto em <#{prod["canal_estoque_id"]}> (1 mensagem = 1 entrega)'
+            onde = (f'Mande o conteúdo em <#{prod["canal_estoque_id"]}> (o mesmo para todos)' if prod.get("conteudo_fixo") and prod.get("canal_estoque_id")
+                    else f'Mande o produto em <#{prod["canal_estoque_id"]}> (1 mensagem = 1 entrega)'
                     if prod.get("canal_estoque_id") else "Configure a entrega do produto")
             await dc("POST", f"/channels/{canal}/messages", corpo={
                 "content": (f"⚠️ <@{quem}>, acabou o estoque de **{prod['nome']}**. {onde} e clique em **✅ Confirmar** de novo.\n"
                             f'<@{c["comprador"]}>, seu pagamento já foi visto. Só aguarde um pouquinho.'),
-                "allowed_mentions": {"parse": [], "users": [quem, c["comprador"]]}})
+                "allowed_mentions": {"parse": [], "users": list(dict.fromkeys([quem, c["comprador"]]))}})
             return
         entrega = await _entregar(c, prod, item)
         na_dm = entrega["dm"]
@@ -3441,6 +3448,8 @@ def _resumo_produto(p: dict) -> dict:
         "aprovador": p.get("cargo_aprovador_nome") or "nenhum (só o dono do servidor)",
         "cargo_cliente": p.get("cargo_cliente_nome") or "nenhum",
         "canal_estoque": f'<#{p["canal_estoque_id"]}>' if p.get("canal_estoque_id") else "nenhum",
+        "tipo_de_estoque": ("conteúdo fixo: a mensagem mais recente do canal vai para todos e não é apagada"
+                            if p.get("conteudo_fixo") else "1 mensagem = 1 entrega (apagada depois de entregar)"),
         "entrega_texto": "configurado" if p.get("entrega_texto") else "nenhum",
         "entrega": {"canal": f'canal privado do comprador (apagado em {p.get("dias_entrega") or DIAS_ENTREGA_PADRAO} dias)',
                     "dm": "DM do comprador",
@@ -3462,7 +3471,8 @@ async def configurar_produto(produto: str, nome: str | None = None, preco: str |
                              categoria: str | None = None, cargo_aprovador: str | None = None,
                              canal_vendas: str | None = None, cor: str | None = None,
                              ativo: bool | None = None, entrega: str | None = None,
-                             dias_entrega: int | None = None, categoria_entrega: str | None = None) -> dict:
+                             dias_entrega: int | None = None, categoria_entrega: str | None = None,
+                             conteudo_fixo: bool | None = None) -> dict:
     """Cria ou atualiza um produto da loja (compra em chat privado com Pix).
     produto = identificador curto (ex.: chatgpt-astra). preco em reais (ex.: "19,90").
     Pagamento: o QR Code e o "copia e cola" saem da variável PIX_CHAVE do Render com o valor do produto;
@@ -3474,7 +3484,9 @@ async def configurar_produto(produto: str, nome: str | None = None, preco: str |
     tickets) e canal_vendas (padrão: registro-de-vendas). Passe "" para limpar um campo.
     entrega = onde o produto chega quando o pagamento é confirmado: "canal" (padrão: canal privado só do
     comprador, apagado depois de dias_entrega dias, padrão 7), "dm" ou "canal_e_dm".
-    categoria_entrega = categoria dos canais de entrega (padrão: a mesma dos chats de compra)."""
+    categoria_entrega = categoria dos canais de entrega (padrão: a mesma dos chats de compra).
+    conteudo_fixo=true: o canal_estoque guarda o MESMO conteúdo para todos os compradores. O bot entrega a mensagem
+    mais recente do canal (que não esteja fixada) e não apaga; para trocar o conteúdo, basta mandar uma mensagem nova."""
     await exigir_config()
     pid = _slug(produto, 40)
     if not pid:
@@ -3500,6 +3512,8 @@ async def configurar_produto(produto: str, nome: str | None = None, preco: str |
         p["entrega_modo"] = modo
     if dias_entrega is not None:
         p["dias_entrega"] = max(1, min(60, int(dias_entrega)))
+    if conteudo_fixo is not None:
+        p["conteudo_fixo"] = bool(conteudo_fixo)
     if entrega_texto is not None:
         p["entrega_texto"] = entrega_texto or None
     for campo, valor in (("link_pagamento", link_pagamento), ("qr_imagem_url", qr_imagem_url)):
@@ -3549,6 +3563,8 @@ async def configurar_produto(produto: str, nome: str | None = None, preco: str |
         avisos.append("PIX_COPIA_COLA é um código fixo: o valor dele não muda com o preço do produto.")
     if not p.get("canal_estoque_id") and not p.get("entrega_texto"):
         avisos.append("Sem entrega automática: configure canal_estoque ou entrega_texto.")
+    if p.get("conteudo_fixo") and not p.get("canal_estoque_id"):
+        avisos.append("conteudo_fixo precisa de um canal_estoque com a mensagem do conteúdo.")
     if not p.get("cargo_aprovador_id"):
         avisos.append("Sem cargo aprovador: só o dono do servidor consegue confirmar pagamentos.")
     if not p.get("preco"):
