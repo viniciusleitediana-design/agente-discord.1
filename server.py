@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "3.1"
+VERSAO = "3.2"
 INICIO = time.time()
 
 
@@ -2856,6 +2856,10 @@ async def ler_mensagens(canal_id: str, limite: int = 20) -> dict:
             item["embed"] = "\n".join(x for x in (e0.get("title"), (e0.get("description") or "")[:1500]) if x)
         if m.get("components"):
             item["botoes"] = [b.get("texto") or b.get("tipo") for b in _resumo_componentes(m["components"])]
+            opcoes = [f'{o.get("texto")} — {o.get("descricao") or ""}'.strip(" —")
+                      for b in _resumo_componentes(m["components"]) for o in b.get("opcoes", [])]
+            if opcoes:
+                item["opcoes_do_menu"] = opcoes
         if m.get("attachments"):
             item["anexos"] = [a["filename"] for a in m["attachments"]]
         if m.get("pinned"):
@@ -5559,11 +5563,14 @@ COMANDOS_VENDAS: list[dict[str, Any]] = [
      "options": [{"type": 3, "name": "key", "description": "A key", "required": False},
                  {"type": 3, "name": "pedido", "description": "ID do pedido (ECO-…)", "required": False, "autocomplete": True},
                  {"type": 5, "name": "mostrar_completa", "description": "Mostrar a key inteira (só para você)", "required": False}]},
-    {"name": "key_revogar", "description": "Revogar uma key (tira do estoque ou marca a entregue como revogada)", "type": 1,
+    {"name": "key_revogar", "description": "Revogar uma key, ou zerar o estoque de um plano inteiro", "type": 1,
      "default_member_permissions": "8",
      "options": [{"type": 3, "name": "motivo", "description": "Motivo", "required": True, "max_length": 200},
                  {"type": 3, "name": "key", "description": "A key", "required": False},
-                 {"type": 3, "name": "pedido", "description": "ID do pedido (ECO-…)", "required": False, "autocomplete": True}]},
+                 {"type": 3, "name": "pedido", "description": "ID do pedido (ECO-…)", "required": False, "autocomplete": True},
+                 _opcional(_OP_JOGO, "Jogo (para zerar o estoque)"), _opcional(_OP_PLANO, "Plano (para zerar o estoque)"),
+                 {"type": 5, "name": "zerar_estoque", "description": "Revogar TODAS as keys disponíveis do jogo e plano escolhidos",
+                  "required": False}]},
     {"name": "entrega_configurar", "description": "Cadastrar login e instruções enviados junto com a key", "type": 1,
      "default_member_permissions": "8",
      "options": [_OP_JOGO, _opcional(_OP_PLANO, "Plano (vazio = vale para todos os planos do jogo)")]},
@@ -5805,6 +5812,25 @@ async def ao_comando_vendas(r: _Resposta, nome: str, op: dict, dados: dict) -> N
         await r.editar_original({"embeds": [{"title": "🔑 Consulta de key", "description": "\n".join(linhas), "color": NEON}],
                                  "allowed_mentions": {"parse": []}})
         r.adiada = False
+
+    elif nome == "key_revogar" and op.get("zerar_estoque"):
+        if not (op.get("jogo") and op.get("plano")):
+            await r.efemera("Para zerar o estoque, escolha também o **jogo** e o **plano**.")
+            return
+        jid, plano = op["jogo"], op["plano"]
+        j, pr = _jogo(jid), _produto(jid, plano)
+        with _tx() as conn:
+            n = conn.execute("UPDATE keys SET status = 'revogada', revogada_por = ?, revogada_em = ?, motivo_revogacao = ? "
+                             "WHERE jogo = ? AND plano = ? AND status = 'disponivel'",
+                             (quem, _agora_iso(), op["motivo"][:200], jid, plano)).rowcount
+            _auditar(conn, "estoque_zerado", None, quem, f'{jid}/{plano}: {n} keys • {op["motivo"][:150]}')
+        abertos = _estoque(jid, plano)["em_aberto"]
+        aviso = (f"\nℹ️ Há {abertos} pedido(s) em andamento desse plano: se forem aprovados sem estoque, ficam aguardando keys "
+                 "e o FUNDADOR é avisado." if abertos else "")
+        await r.efemera(f'⛔ Estoque zerado: **{n}** key(s) disponível(is) de {_rotulo_jogo(j)} • {pr["nome"]} revogada(s). '
+                        f"Keys já entregues não foram mexidas.{aviso}")
+        await registrar_venda_log(f'⛔ <@{quem}> zerou o estoque de {_rotulo_jogo(j)} • {pr["nome"]} ({n} keys). Motivo: {op["motivo"][:150]}')
+        _paineis_depois(1, jogo=jid)
 
     elif nome == "key_revogar":
         k = _achar_key(op.get("key"), op.get("pedido"))
