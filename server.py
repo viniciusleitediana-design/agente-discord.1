@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "3.0"
+VERSAO = "3.1"
 INICIO = time.time()
 
 
@@ -4793,20 +4793,16 @@ async def registrar_venda_log(texto: str) -> None:
 # ── painéis de venda (1 por canal de jogo) ──
 
 def _embed_painel(j: sqlite3.Row) -> dict:
-    produtos = _q("SELECT * FROM produtos WHERE jogo = ? AND ativo = 1", (j["id"],))
-    produtos = sorted(produtos, key=lambda p: _ORDEM_PLANOS.get(p["plano"], 99))
-    tabela = "\n".join(f'`{p["nome"].replace("Key ", ""):<11}` **{_reais_c(p["preco_centavos"])}**' for p in produtos) \
-        or "_Nenhum plano à venda no momento._"
     intro = j["descricao"] or (f'Keys para **{j["nome"]}** na plataforma **{j["plataforma"]}**.\n'
                                "Escolha o plano no menu abaixo e finalize a compra num canal privado só seu.")
-    descricao = (f"{intro}\n\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n🔑 **PLANOS**\n{tabela}\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n"
+    descricao = (f"{intro}\n\n"
                  "💳 **PAGAMENTO**\nPix com QR Code e copia e cola, gerado com o **valor exato** do plano escolhido. "
                  "A equipe confere cada pagamento antes de liberar a key.\n\n"
                  "🛒 **COMO COMPRAR**\n**1.** Escolha o plano no menu abaixo\n"
                  "**2.** Um canal privado de pagamento é criado só para você\n"
                  "**3.** Pague o Pix e clique em **CONFIRMAR PAGAMENTO**\n"
                  "**4.** Informe o nome completo de quem pagou\n"
-                 "**5.** Aprovado o pagamento, sua key chega num **canal privado de entrega**")
+                 "**5.** Aprovado o pagamento, o passo a passo, seu login e sua key chegam num **canal privado de entrega**")
     embed: dict[str, Any] = {"title": f'{j["emoji"] or "🟢"} ECO CHEATS • {j["nome"].upper()} {j["plataforma"].upper()}',
                              "description": descricao[:4096], "color": NEON,
                              "footer": {"text": "ECO CHEATS • Pagamento via Pix • Entrega em canal privado"}}
