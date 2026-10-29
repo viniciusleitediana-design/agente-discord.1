@@ -5640,9 +5640,11 @@ def _ler_keys(texto: str) -> tuple[list[str], int, list[str]]:
     """Separa as keys de um texto ou arquivo. Devolve (keys, quantos trechos foram ignorados, keys fora do padrão).
     Quando quase todas as keys têm o mesmo formato (5 ou mais, 80%+), as que fogem dele também ficam de fora
     e são mostradas para conferência: costuma ser título ou rodapé do arquivo, não key."""
-    pedacos = [x for x in re.split(r"[\s,;]+", texto or "") if x.strip()]
-    keys = [x.strip().strip(_BORDAS_KEY).rstrip(".") for x in pedacos if _parece_key(x)]
-    ignorados = len(pedacos) - len(keys)
+    keys, ignorados = [], 0
+    for linha in (texto or "").splitlines():
+        achadas = [x.strip().strip(_BORDAS_KEY).rstrip(".") for x in re.split(r"[\s,;]+", linha) if x.strip() and _parece_key(x)]
+        keys += achadas
+        ignorados += 0 if achadas or not linha.strip() else 1
     fora: list[str] = []
     if len(keys) >= 5:
         contagem: dict[str, int] = {}
@@ -5836,7 +5838,7 @@ async def ao_comando_vendas(r: _Resposta, nome: str, op: dict, dados: dict) -> N
         keys, ignorados, fora = _ler_keys(bruto)
         if not keys:
             await r.efemera("Nenhuma key encontrada. Mande em **keys** (separadas por espaço, vírgula ou linha) ou em um arquivo .txt."
-                            + (f"\nIgnorei {ignorados} trecho(s) que não parecem key (títulos, numeração, separadores)." if ignorados else ""))
+                            + (f"\nIgnorei {ignorados} linha(s) sem key (título, grupos, separadores)." if ignorados else ""))
             return
         if len(keys) > 1000:
             await r.efemera("Mande no máximo 1000 keys por vez.")
@@ -5865,7 +5867,7 @@ async def ao_comando_vendas(r: _Resposta, nome: str, op: dict, dados: dict) -> N
         est = _estoque(jid, plano)
         lidas = list(dict.fromkeys(keys))
         conferir = (f"\n📄 Li **{len(lidas)}** key(s) (primeira {_mascarar(lidas[0])} • última {_mascarar(lidas[-1])})"
-                    + (f"; ignorei {ignorados} trecho(s) que não são key (títulos, numeração, separadores)." if ignorados else ".")
+                    + (f"; ignorei {ignorados} linha(s) sem key (título, grupos, separadores)." if ignorados else ".")
                     + (f"\n🔎 {len(fora)} fora do formato das outras, **não** adicionada(s): "
                        + ", ".join(f"`{x[:40]}`" for x in fora[:5]) + (" …" if len(fora) > 5 else "")
                        + ". Se for key mesmo, mande sozinha em **keys**." if fora else ""))
