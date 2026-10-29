@@ -8,6 +8,7 @@ Conector MCP que deixa o Claude controlar o servidor ECO PULSE e mantém automa�
 - **Mensagens:** enviar com embed e botão de link, editar, ler, limpar em massa, fixar, reagir, enquete, DM
 - **Automações:** mensagens agendadas/repetidas, boas-vindas com cargo automático, despedida, respostas automáticas, cargos por reação, canal de registros, filtro de palavras e convites (AutoMod)
 - **Cargos e moderação:** criar/editar/apagar cargos, dar/tirar cargo, apelido, castigo, expulsar, banir, desbanir
+- **Comunidade:** painel de **ticket** (canal privado com a equipe, assumir, fechar com histórico .txt), painel de **verificação** (botão dá cargo), **sorteios** (participar, sorteio automático na hora, ressortear) e `ver_mensagem` + `copiar_de` para copiar painéis de outros bots
 - **Loja:** painel com botão **Comprar agora** → chat privado (comprador + Fundador) com QR Code e Pix copia e cola → **Confirmar pagamento** com nome completo → o Fundador confirma (produto entregue por DM na hora, tirado do canal de estoque) ou recusa (chat fechado)
 
 As automações e as compras em andamento ficam salvas no canal privado `#agente-config` do próprio servidor, então sobrevivem a reinícios do Render.

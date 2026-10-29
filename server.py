@@ -43,6 +43,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import secrets
 import time
@@ -72,7 +73,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "2.1"
+VERSAO = "2.2"
 INICIO = time.time()
 
 
@@ -131,6 +132,7 @@ ERROS = {
     10026: "Esse usuário não está banido.",
     30005: "O servidor chegou ao limite de 250 cargos.",
     30013: "O servidor chegou ao limite de 500 canais.",
+    50005: "Essa mensagem é de outro usuário ou bot e não pode ser editada. Publique uma nova (dá para usar copiar_de).",
     50001: "O bot não tem acesso a isso (Missing Access). Confira se o cargo do bot consegue ver o canal.",
     50007: "Não deu para mandar DM: a pessoa bloqueou mensagens diretas.",
     50013: ("O bot não tem permissão para isso (Missing Permissions). Dê ao cargo do bot a permissão de "
@@ -590,7 +592,7 @@ def _link_canal(gid: str, cid: str, mid: str | None = None) -> str:
 
 CONFIG_PADRAO: dict[str, Any] = {"versao": 1, "agendadas": [], "boas_vindas": {}, "despedida": {},
                                  "respostas": [], "cargos_reacao": [], "logs": {},
-                                 "produtos": {}, "compras": {}}
+                                 "produtos": {}, "compras": {}, "paineis": {}, "tickets": {}, "sorteios": {}}
 _cfg: dict[str, Any] = deepcopy(CONFIG_PADRAO)
 _cfg_estado: dict[str, Any] = {"carregada": False, "canal_id": None, "msg_id": None, "aviso": None, "tentativa": 0.0}
 _cfg_lock = asyncio.Lock()
@@ -781,7 +783,7 @@ async def rodar_vencidas() -> None:
             continue
         if agora - prox <= TOLERANCIA_ATRASO:
             try:
-                await dc("POST", f'/channels/{item["canal_id"]}/messages', corpo=item["mensagem"])
+                await _postar(item["canal_id"], item["mensagem"])
                 item["envios"] = item.get("envios", 0) + 1
                 item["ultimo_envio"] = agora.isoformat()
                 item.pop("ultimo_erro", None)
@@ -811,12 +813,14 @@ async def loop_agendador() -> None:
             raise
         except Exception:
             log.exception("Erro no agendador")
-        try:
-            await fechar_compras()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Erro ao fechar chats de compra")
+        for tarefa, rotulo in ((fechar_compras, "fechar chats de compra"), (rodar_sorteios, "encerrar sorteios"),
+                               (limpar_tickets, "fechar tickets")):
+            try:
+                await tarefa()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Erro ao %s", rotulo)
         await asyncio.sleep(20)
 
 
@@ -847,7 +851,7 @@ def _campos_membro(uid: str, nome: str, servidor: str, membros: Any) -> dict[str
 async def _mandar_config_mensagem(conf: dict, campos: dict[str, str], canal_id: str) -> None:
     payload = montar_mensagem(texto=conf.get("texto"), titulo=conf.get("titulo"), descricao=conf.get("descricao"),
                               cor=conf.get("cor"), imagem_url=conf.get("imagem_url"))
-    await dc("POST", f"/channels/{canal_id}/messages", corpo=_preencher(payload, campos))
+    await _postar(canal_id, _preencher(payload, campos))
 
 
 async def ao_entrar(uid: str, nome: str, servidor: str, membros: Any, bot: bool) -> None:
@@ -1547,26 +1551,769 @@ async def fechar_compras() -> None:
         await salvar_config()
 
 
+# ───────────────────────── comunidade: tickets, verificação e sorteios ─────────────────────────
+
+FECHAR_TICKET_EM = 5                       # segundos entre "Fechar" e o canal sumir
+_CDN_ANEXO = re.compile(r"^https://(?:cdn\.discordapp\.com|media\.discordapp\.net)/(?:ephemeral-)?attachments/", re.I)
+_ESTILOS_BOTAO = {"azul": 1, "roxo": 1, "primario": 1, "cinza": 2, "secundario": 2, "verde": 3, "vermelho": 4}
+_ticket_lock = asyncio.Lock()
+_salvar_tarefa: asyncio.Task | None = None
+_tarefas_sorteio: dict[str, asyncio.Task] = {}
+
+
+def _salvar_depois(segundos: float = 15) -> None:
+    """Junta várias mudanças pequenas (ex.: cliques em sorteio) em um salvamento só."""
+    global _salvar_tarefa
+    if _salvar_tarefa and not _salvar_tarefa.done():
+        return
+
+    async def _rodar():
+        await asyncio.sleep(segundos)
+        try:
+            await salvar_config()
+        except Exception:
+            log.exception("Falha ao salvar a memória")
+
+    _salvar_tarefa = asyncio.create_task(_rodar())
+
+
+async def _salvar_pendente() -> None:
+    """No desligamento: salva na hora o que estava esperando para ser salvo."""
+    if _salvar_tarefa and not _salvar_tarefa.done():
+        _salvar_tarefa.cancel()
+        try:
+            await salvar_config()
+        except Exception:
+            log.exception("Falha ao salvar a memória no desligamento")
+
+
+def _ts(dt: datetime | str) -> int:
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt)
+    return int(dt.timestamp())
+
+
+def _emoji_botao(emoji: str | None) -> dict | None:
+    if not emoji:
+        return None
+    s = str(emoji).strip()
+    m = re.fullmatch(r"<(a?):(\w+):(\d+)>", s)
+    if m:
+        return {"name": m.group(2), "id": m.group(3), "animated": bool(m.group(1))}
+    return {"name": s}
+
+
+def _botao_painel(texto: str, custom_id: str, cor: str | None, emoji: str | None) -> dict:
+    estilo = _ESTILOS_BOTAO.get(_norm(cor or "azul"), 1)
+    b: dict[str, Any] = {"type": 2, "style": estilo, "label": (texto or "Clique aqui")[:80], "custom_id": custom_id[:100]}
+    e = _emoji_botao(emoji)
+    if e:
+        b["emoji"] = e
+    return b
+
+
+def _ref_mensagem(ref: str, canal_padrao: str | None = None) -> tuple[str, str]:
+    """Aceita link da mensagem, 'canal_id/mensagem_id' ou só o ID da mensagem (com canal_padrao)."""
+    s = str(ref).strip()
+    m = re.search(r"channels/(?:\d+|@me)/(\d+)/(\d+)", s) or re.fullmatch(r"(\d{15,22})\D+(\d{15,22})", s)
+    if m:
+        return m.group(1), m.group(2)
+    if re.fullmatch(r"\d{15,22}", s) and canal_padrao:
+        return canal_padrao, s
+    raise ErroDiscord(f'Não entendi a mensagem "{ref}". Use o link da mensagem (Copiar link) ou "canal_id/mensagem_id".')
+
+
+async def _buscar_mensagem(ref: str, canal_padrao: str | None = None) -> dict:
+    canal_ref = None
+    if canal_padrao:
+        canal_ref = (await achar_canal(canal_padrao))["id"]
+    canal, msg = _ref_mensagem(ref, canal_ref)
+    return await dc("GET", f"/channels/{canal}/messages/{msg}")
+
+
+def _limpar_embed(e: dict) -> dict:
+    """Embed recebido da API → embed pronto para reenviar (só os campos que o Discord aceita)."""
+    novo: dict[str, Any] = {}
+    for k in ("title", "description", "url", "color"):
+        if e.get(k) not in (None, ""):
+            novo[k] = e[k]
+    if e.get("fields"):
+        novo["fields"] = [{"name": f.get("name") or "​", "value": f.get("value") or "​",
+                           "inline": bool(f.get("inline"))} for f in e["fields"]][:25]
+    for k in ("image", "thumbnail"):
+        if (e.get(k) or {}).get("url"):
+            novo[k] = {"url": e[k]["url"]}
+    if (e.get("author") or {}).get("name"):
+        a = {"name": e["author"]["name"]}
+        for k in ("icon_url", "url"):
+            if e["author"].get(k):
+                a[k] = e["author"][k]
+        novo["author"] = a
+    if (e.get("footer") or {}).get("text"):
+        f = {"text": e["footer"]["text"]}
+        if e["footer"].get("icon_url"):
+            f["icon_url"] = e["footer"]["icon_url"]
+        novo["footer"] = f
+    return novo
+
+
+def _resumo_componentes(linhas: list[dict]) -> list[dict]:
+    saida: list[dict] = []
+    for linha in linhas or []:
+        for c in linha.get("components", []):
+            emoji = c.get("emoji") or {}
+            emoji_txt = (f'<{"a" if emoji.get("animated") else ""}:{emoji["name"]}:{emoji["id"]}>' if emoji.get("id")
+                         else emoji.get("name"))
+            if c.get("type") == 2:
+                item = {"tipo": "botão", "texto": c.get("label"), "emoji": emoji_txt,
+                        "cor": {1: "azul", 2: "cinza", 3: "verde", 4: "vermelho", 5: "link"}.get(c.get("style"), "?")}
+                if c.get("url"):
+                    item["link"] = c["url"]
+                else:
+                    item["custom_id"] = c.get("custom_id")
+            elif c.get("type") in (3, 5, 6, 7, 8):
+                item = {"tipo": "menu", "texto": c.get("placeholder"), "custom_id": c.get("custom_id"),
+                        "opcoes": [{"texto": o.get("label"), "descricao": o.get("description"),
+                                    "emoji": (o.get("emoji") or {}).get("name")} for o in c.get("options", [])]}
+            else:
+                item = {"tipo": f"componente {c.get('type')}"}
+            saida.append({k: v for k, v in item.items() if v not in (None, "", [])})
+    return saida
+
+
+async def _refrescar_url(url: str) -> str:
+    """Links de anexo do Discord expiram em ~24 h; esta rota devolve um link novo."""
+    try:
+        r = await dc("POST", "/attachments/refresh-urls", corpo={"attachment_urls": [url]})
+        return r["refreshed_urls"][0]["refreshed"] or url
+    except Exception:
+        return url
+
+
+async def _baixar_imagem(url: str) -> tuple[bytes, str] | None:
+    try:
+        r = await cliente_web().get(await _refrescar_url(url))
+        r.raise_for_status()
+        if not r.content or len(r.content) > 9_500_000:
+            return None
+        nome = url.split("?")[0].rsplit("/", 1)[-1]
+        nome = re.sub(r"[^A-Za-z0-9._-]+", "_", nome)[-60:].strip("._") or "imagem.png"
+        if "." not in nome:
+            nome += ".png"
+        return r.content, nome
+    except Exception as erro:
+        log.warning("Não consegui baixar a imagem %s: %s", url[:80], erro)
+        return None
+
+
+async def _postar(canal_id: str, payload: dict, editar_id: str | None = None) -> dict:
+    """Envia (ou edita) uma mensagem. Imagens que são anexos do Discord (links que expiram) são
+    baixadas e reenviadas junto, para nunca quebrarem."""
+    payload = deepcopy(payload)
+    arquivos: dict[str, tuple[str, bytes, str]] = {}
+    anexos: list[dict] = []
+
+    async def trocar(url: str | None) -> str | None:
+        if not url or not _CDN_ANEXO.match(url):
+            return url
+        baixado = await _baixar_imagem(url)
+        if not baixado:
+            return url
+        conteudo, nome = baixado
+        nome = f"{len(anexos)}_{nome}"
+        anexos.append({"id": len(anexos), "filename": nome})
+        tipo = "image/gif" if nome.lower().endswith(".gif") else "image/jpeg" if nome.lower().endswith((".jpg", ".jpeg")) \
+            else "image/webp" if nome.lower().endswith(".webp") else "image/png"
+        arquivos[f"files[{len(anexos) - 1}]"] = (nome, conteudo, tipo)
+        return f"attachment://{nome}"
+
+    for e in payload.get("embeds") or []:
+        for k in ("image", "thumbnail"):
+            if (e.get(k) or {}).get("url"):
+                e[k]["url"] = await trocar(e[k]["url"])
+        for k in ("author", "footer"):
+            if (e.get(k) or {}).get("icon_url"):
+                e[k]["icon_url"] = await trocar(e[k]["icon_url"])
+    metodo, rota = ("PATCH", f"/channels/{canal_id}/messages/{editar_id}") if editar_id else ("POST", f"/channels/{canal_id}/messages")
+    if arquivos:
+        payload["attachments"] = anexos
+        return await dc(metodo, rota, dados={"payload_json": json.dumps(payload)}, arquivos=arquivos)
+    return await dc(metodo, rota, corpo=payload)
+
+
+async def _guardar_imagem(url: str | None) -> str | None:
+    """Para mensagens que repetem (boas-vindas, agendadas): copia a imagem de um anexo do Discord para o
+    canal de memória do agente, assim ela continua existindo mesmo se a mensagem original for apagada."""
+    if not url or not _CDN_ANEXO.match(url):
+        return url
+    baixado = await _baixar_imagem(url)
+    if not baixado:
+        return url
+    conteudo, nome = baixado
+    canal = _cfg_estado.get("canal_id") or await _canal_config()
+    msg = await dc("POST", f"/channels/{canal}/messages",
+                   dados={"payload_json": json.dumps({"content": "🖼️ Imagem usada pelo agente. Não apague.",
+                                                      "attachments": [{"id": 0, "filename": nome}]})},
+                   arquivos={"files[0]": (nome, conteudo, "application/octet-stream")})
+    return msg["attachments"][0]["url"].split("?")[0]
+
+
+async def _montar_painel(*, copiar_de: str | None, titulo: str | None, descricao: str | None, cor: str | None,
+                         imagem_url: str | None, miniatura_url: str | None, rodape: str | None,
+                         titulo_padrao: str, descricao_padrao: str) -> tuple[dict, str | None]:
+    """Monta o embed do painel: copia o visual de outra mensagem (se pedido) e aplica por cima o que foi passado."""
+    embed: dict[str, Any] = {}
+    texto: str | None = None
+    if copiar_de:
+        origem = await _buscar_mensagem(copiar_de)
+        if origem.get("embeds"):
+            embed = _limpar_embed(origem["embeds"][0])
+        texto = (origem.get("content") or "").strip() or None
+        if not embed.get("image"):
+            img = next((a for a in origem.get("attachments", [])
+                        if str(a.get("content_type", "")).startswith("image/")
+                        or a.get("filename", "").lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))), None)
+            if img:
+                embed["image"] = {"url": img["url"]}
+    if titulo is not None:
+        embed["title"] = titulo[:256]
+    if descricao is not None:
+        if len(descricao) > 4096:
+            raise ErroDiscord("A descrição passou de 4096 caracteres.")
+        embed["description"] = descricao
+    if cor:
+        embed["color"] = _cor(cor)
+    if imagem_url is not None:
+        if imagem_url:
+            embed["image"] = {"url": imagem_url}
+        else:
+            embed.pop("image", None)
+    if miniatura_url is not None:
+        if miniatura_url:
+            embed["thumbnail"] = {"url": miniatura_url}
+        else:
+            embed.pop("thumbnail", None)
+    if rodape is not None:
+        if rodape:
+            embed["footer"] = {"text": rodape[:2048]}
+        else:
+            embed.pop("footer", None)
+    if not embed.get("title") and not embed.get("description"):
+        embed["title"], embed["description"] = titulo_padrao, descricao_padrao
+    embed.setdefault("color", COR_PADRAO)
+    return embed, texto
+
+
+def _eh_admin(inter: Any) -> bool:
+    guild = getattr(inter, "guild", None)
+    if guild is not None and getattr(guild, "owner_id", None) == getattr(inter.user, "id", None):
+        return True
+    return bool(getattr(getattr(inter, "permissions", None), "administrator", False))
+
+
+def _eh_equipe(inter: Any, painel: dict) -> bool:
+    if _eh_admin(inter):
+        return True
+    equipe = {c["id"] for c in painel.get("cargos_equipe", [])}
+    return bool(equipe & _ids_cargos(inter.user))
+
+
+async def _criar_canal_privado(nome: str, perms: list[dict], categoria_id: str | None, topico: str, motivo: str) -> dict:
+    gid = await servidor_id()
+    corpo: dict[str, Any] = {"name": nome[:100], "type": 0, "permission_overwrites": perms, "topic": topico[:1024]}
+    if categoria_id:
+        corpo["parent_id"] = categoria_id
+    try:
+        return await dc("POST", f"/guilds/{gid}/channels", corpo=corpo, motivo=motivo)
+    except ErroDiscord as erro:
+        if erro.codigo != 50035:
+            raise
+    corpo["name"] = re.sub(r"[^a-z0-9_-]+", "-", _slug(nome, 90)).strip("-") or "ticket"
+    try:
+        return await dc("POST", f"/guilds/{gid}/channels", corpo=corpo, motivo=motivo)
+    except ErroDiscord as erro:
+        if erro.codigo != 50035 or "parent_id" not in corpo:
+            raise
+    corpo.pop("parent_id", None)  # categoria cheia (50 canais): cria fora dela
+    return await dc("POST", f"/guilds/{gid}/channels", corpo=corpo, motivo=motivo)
+
+
+# ── tickets ──
+
+def _botoes_ticket(assumido: bool) -> dict:
+    botoes = [_botao("Fechar ticket", "ecot:fechar", 4, "🔒")]
+    if not assumido:
+        botoes.append(_botao("Assumir", "ecot:assumir", 2, "🙋"))
+    return _linha(*botoes)
+
+
+async def _abrir_ticket(r: _Resposta, pid: str, escolha: str | None) -> None:
+    inter = r.inter
+    await r.adiar()
+    await exigir_config()
+    painel = _cfg["paineis"].get(pid)
+    if not painel or painel.get("tipo") != "ticket":
+        await r.efemera("Este painel não está mais ativo. Avise a equipe.")
+        return
+    motivo = None
+    if escolha is not None:
+        try:
+            motivo = (painel.get("motivos") or [])[int(escolha)]
+        except (ValueError, IndexError):
+            motivo = str(escolha)
+    uid = str(inter.user.id)
+    nome = getattr(inter.user, "display_name", None) or inter.user.name
+    async with _ticket_lock:
+        for canal_id, t in list(_cfg["tickets"].items()):
+            if t["dono"] == uid and t.get("painel") == pid and t.get("status") == "aberto":
+                if await _canal_existe(canal_id):
+                    await r.efemera(f"Você já tem um ticket aberto: <#{canal_id}>")
+                    return
+                _cfg["tickets"].pop(canal_id, None)
+        _cfg["contador_tickets"] = int(_cfg.get("contador_tickets") or 0) + 1
+        numero = _cfg["contador_tickets"]
+        gid, bot = await servidor_id(), await eu()
+        acesso = VER | ENVIAR | HISTORICO | ANEXAR | EMBED_LINKS
+        perms: list[dict[str, Any]] = [
+            {"id": gid, "type": 0, "allow": "0", "deny": str(VER)},
+            {"id": uid, "type": 1, "allow": str(acesso), "deny": "0"},
+            {"id": bot["id"], "type": 1, "allow": str(acesso | GERENCIAR_MSG), "deny": "0"},
+        ] + [{"id": c["id"], "type": 0, "allow": str(acesso | GERENCIAR_MSG), "deny": "0"} for c in painel.get("cargos_equipe", [])]
+        prefixo = painel.get("prefixo") or "🎫・ticket"
+        canal = await _criar_canal_privado(
+            f"{prefixo}-{_slug(nome, 30) or _slug(inter.user.name, 30) or numero}", perms, painel.get("categoria_id"),
+            f"Ticket #{numero:04d} de <@{uid}>" + (f" • {motivo}" if motivo else "") + " • só você e a equipe veem",
+            f"Ticket de {inter.user.name}")
+        _cfg["tickets"][canal["id"]] = {"painel": pid, "dono": uid, "dono_nome": nome, "numero": numero,
+                                        "motivo": motivo, "aberto": _agora().isoformat(), "status": "aberto"}
+    abertura = painel.get("mensagem_abertura") or (
+        "Olá, {usuario}! Este canal é **privado**: só você e a equipe conseguem ver.\n\n"
+        "Explique com detalhes o que você precisa que a equipe já vem te atender.")
+    descricao = _preencher(abertura, {"usuario": f"<@{uid}>", "usuário": f"<@{uid}>", "nome": nome})
+    if motivo:
+        descricao += f"\n\n📌 **Assunto:** {motivo}"
+    equipe = [c["id"] for c in painel.get("cargos_equipe", [])] if painel.get("avisar_equipe", True) else []
+    try:
+        await dc("POST", f'/channels/{canal["id"]}/messages', corpo={
+            "content": " ".join([f"<@{uid}>"] + [f"<@&{c}>" for c in equipe]),
+            "embeds": [{"title": f"🎫 Ticket #{numero:04d}", "description": descricao, "color": painel.get("cor") or COR_PADRAO,
+                        "footer": {"text": "Para encerrar, clique em 🔒 Fechar ticket"}}],
+            "components": [_botoes_ticket(False)],
+            "allowed_mentions": {"parse": [], "users": [uid], "roles": equipe}})
+    finally:
+        await salvar_config()
+    await r.efemera(f'✅ Seu ticket foi aberto: <#{canal["id"]}>')
+    await registrar(f'🎫 <@{uid}> abriu o ticket #{numero:04d} em <#{canal["id"]}>' + (f" ({motivo})." if motivo else "."))
+
+
+async def _assumir_ticket(r: _Resposta) -> None:
+    inter = r.inter
+    t = _cfg["tickets"].get(str(inter.channel_id))
+    if not t or t.get("status") != "aberto":
+        await r.efemera("Este ticket já foi encerrado.")
+        return
+    painel = _cfg["paineis"].get(t.get("painel"), {})
+    if not _eh_equipe(inter, painel):
+        await r.efemera("Só a equipe pode assumir tickets.")
+        return
+    if t.get("assumido_por"):
+        await r.efemera(f'Este ticket já está com <@{t["assumido_por"]}>.')
+        return
+    quem = str(inter.user.id)
+    nome_quem = getattr(inter.user, "display_name", None) or inter.user.name
+    t["assumido_por"], t["assumido_nome"] = quem, nome_quem
+    embed = _com_rodape(_embed_da_mensagem(inter), f"🙋 Atendido por {nome_quem} • para encerrar, clique em 🔒 Fechar ticket")
+    await r.enviar(7, {"embeds": [embed], "components": [_botoes_ticket(True)]})
+    await dc("POST", f"/channels/{inter.channel_id}/messages", corpo={
+        "content": f'🙋 <@{quem}> assumiu o seu atendimento, <@{t["dono"]}>.',
+        "allowed_mentions": {"parse": [], "users": [t["dono"]]}})
+    await salvar_config()
+
+
+async def _pedir_confirmacao_fechar(r: _Resposta) -> None:
+    inter = r.inter
+    t = _cfg["tickets"].get(str(inter.channel_id))
+    if not t or t.get("status") != "aberto":
+        await r.efemera("Este ticket já está sendo encerrado.")
+        return
+    painel = _cfg["paineis"].get(t.get("painel"), {})
+    if str(inter.user.id) != t["dono"] and not _eh_equipe(inter, painel):
+        await r.efemera("Só quem abriu o ticket ou a equipe pode fechar.")
+        return
+    await r.enviar(4, {"content": "Tem certeza que quer **fechar** este ticket? O canal será apagado e o histórico fica salvo.",
+                       "flags": 64, "components": [_linha(_botao("Sim, fechar", "ecot:confirmar", 4, "🔒"))]})
+
+
+async def _historico_ticket(canal_id: str) -> tuple[bytes, int]:
+    msgs: list[dict] = []
+    antes = None
+    for _ in range(30):  # até 3000 mensagens
+        params: dict[str, Any] = {"limit": 100}
+        if antes:
+            params["before"] = antes
+        lote = await dc("GET", f"/channels/{canal_id}/messages", params=params)
+        if not lote:
+            break
+        msgs.extend(lote)
+        antes = lote[-1]["id"]
+        if len(lote) < 100:
+            break
+    linhas = []
+    for m in reversed(msgs):
+        autor = m["author"].get("global_name") or m["author"]["username"]
+        partes = [m.get("content") or ""]
+        for e in m.get("embeds", []):
+            partes.append(" | ".join(x for x in (e.get("title"), e.get("description")) if x))
+        partes += [a["url"].split("?")[0] for a in m.get("attachments", [])]
+        texto = "\n    ".join(p for p in partes if p) or "(sem texto)"
+        linhas.append(f"[{_fmt(m['timestamp'])}] {autor} (@{m['author']['username']}): {texto}")
+    return ("\n".join(linhas) + "\n").encode(), len(msgs)
+
+
+async def encerrar_ticket(canal_id: str, quem: str | None, quem_nome: str) -> None:
+    """Salva o histórico, avisa o dono e apaga o canal do ticket."""
+    t = _cfg["tickets"].get(canal_id)
+    if not t or t.get("status") == "fechando":
+        return
+    t["status"] = "fechando"
+    t["fechar_em"] = (_agora() + timedelta(seconds=FECHAR_TICKET_EM)).isoformat()
+    t["fechado_por"] = quem
+    await salvar_config()
+    painel = _cfg["paineis"].get(t.get("painel"), {})
+    try:
+        historico, total = await _historico_ticket(canal_id)
+    except ErroDiscord as erro:
+        log.warning("Não consegui ler o histórico do ticket %s: %s", canal_id, erro)
+        historico, total = b"", 0
+    nome_arquivo = f'ticket-{int(t.get("numero") or 0):04d}-{_slug(t.get("dono_nome"), 20) or t["dono"]}.txt'
+    resumo = {"title": f'🎫 Ticket #{int(t.get("numero") or 0):04d} fechado', "color": CORES["cinza"], "description": (
+        f'👤 **Aberto por:** <@{t["dono"]}>\n' + (f'📌 **Assunto:** {t["motivo"]}\n' if t.get("motivo") else "")
+        + (f'🙋 **Atendido por:** <@{t["assumido_por"]}>\n' if t.get("assumido_por") else "")
+        + f"🔒 **Fechado por:** {f'<@{quem}>' if quem else quem_nome}\n"
+        + f'🕐 **Aberto em:** {_fmt(t.get("aberto"))} • **Fechado em:** {_fmt(_agora())}\n💬 **Mensagens:** {total}')}
+    destino = painel.get("canal_historico_id") or ((_cfg.get("logs") or {}).get("canal_id") if (_cfg.get("logs") or {}).get("ativo") else None)
+    if destino and historico:
+        try:
+            await dc("POST", f"/channels/{destino}/messages", dados={"payload_json": json.dumps({
+                "embeds": [resumo], "allowed_mentions": {"parse": []}, "attachments": [{"id": 0, "filename": nome_arquivo}]})},
+                arquivos={"files[0]": (nome_arquivo, historico, "text/plain")})
+        except ErroDiscord as erro:
+            log.warning("Não consegui salvar o histórico do ticket: %s", erro)
+    try:
+        dm = await dc("POST", "/users/@me/channels", corpo={"recipient_id": t["dono"]})
+        aviso = {"title": "🎫 Seu ticket foi fechado", "color": CORES["cinza"],
+                 "description": "Obrigado pelo contato! Se precisar de novo, é só abrir outro ticket no servidor."}
+        if historico:
+            await dc("POST", f'/channels/{dm["id"]}/messages', dados={"payload_json": json.dumps({
+                "embeds": [aviso], "attachments": [{"id": 0, "filename": nome_arquivo}]})},
+                arquivos={"files[0]": (nome_arquivo, historico, "text/plain")})
+        else:
+            await dc("POST", f'/channels/{dm["id"]}/messages', corpo={"embeds": [aviso]})
+    except ErroDiscord:
+        pass
+    await asyncio.sleep(max(0.0, (datetime.fromisoformat(t["fechar_em"]) - _agora()).total_seconds()))
+    await _apagar_ticket(canal_id)
+
+
+async def _apagar_ticket(canal_id: str) -> None:
+    t = _cfg["tickets"].get(canal_id)
+    try:
+        await dc("DELETE", f"/channels/{canal_id}", motivo="Ticket fechado")
+    except ErroDiscord as erro:
+        if erro.status != 404 and erro.codigo != 10003:
+            log.warning("Não consegui apagar o ticket %s: %s", canal_id, erro)
+            return
+    if t:
+        _cfg["tickets"].pop(canal_id, None)
+        await registrar(f'🔒 Ticket #{int(t.get("numero") or 0):04d} de <@{t["dono"]}> fechado.')
+        await salvar_config()
+
+
+async def _confirmar_fechar(r: _Resposta) -> None:
+    inter = r.inter
+    canal_id = str(inter.channel_id)
+    t = _cfg["tickets"].get(canal_id)
+    if not t or t.get("status") != "aberto":
+        await r.efemera("Este ticket já está sendo encerrado.")
+        return
+    painel = _cfg["paineis"].get(t.get("painel"), {})
+    if str(inter.user.id) != t["dono"] and not _eh_equipe(inter, painel):
+        await r.efemera("Só quem abriu o ticket ou a equipe pode fechar.")
+        return
+    await r.enviar(7, {"content": "🔒 Fechando…", "components": []})
+    nome = getattr(inter.user, "display_name", None) or inter.user.name
+    await dc("POST", f"/channels/{canal_id}/messages", corpo={
+        "content": f"🔒 Ticket fechado por <@{inter.user.id}>. O histórico foi salvo e este canal some em {FECHAR_TICKET_EM} segundos.",
+        "allowed_mentions": {"parse": []}})
+    await encerrar_ticket(canal_id, str(inter.user.id), nome)
+
+
+async def limpar_tickets() -> None:
+    """Termina de fechar tickets que ficaram pela metade (ex.: o bot reiniciou) e esquece canais apagados à mão."""
+    if not _cfg_estado["carregada"] or not _cfg.get("tickets"):
+        return
+    agora = _agora()
+    for canal_id, t in list(_cfg["tickets"].items()):
+        if t.get("status") == "fechando" and t.get("fechar_em") and datetime.fromisoformat(t["fechar_em"]) <= agora - timedelta(seconds=30):
+            await _apagar_ticket(canal_id)
+
+
+# ── verificação ──
+
+async def _verificar(r: _Resposta, pid: str) -> None:
+    inter = r.inter
+    await r.adiar()
+    await exigir_config()
+    painel = _cfg["paineis"].get(pid)
+    if not painel or painel.get("tipo") != "verificacao":
+        await r.efemera("Este painel não está mais ativo. Avise a equipe.")
+        return
+    uid = str(inter.user.id)
+    gid = await servidor_id()
+    cargos = _ids_cargos(inter.user)
+    if painel["cargo_id"] in cargos and not (painel.get("tirar_cargo_id") and painel["tirar_cargo_id"] in cargos):
+        await r.efemera("✅ Você já está verificado!")
+        return
+    await dc("PUT", f'/guilds/{gid}/members/{uid}/roles/{painel["cargo_id"]}', motivo="Verificação")
+    if painel.get("tirar_cargo_id") and painel["tirar_cargo_id"] in cargos:
+        try:
+            await dc("DELETE", f'/guilds/{gid}/members/{uid}/roles/{painel["tirar_cargo_id"]}', motivo="Verificação")
+        except ErroDiscord as erro:
+            log.warning("Não consegui tirar o cargo de não verificado: %s", erro)
+    await r.efemera(painel.get("mensagem_sucesso") or "✅ Verificado! Agora você tem acesso ao servidor. Seja bem-vindo(a)!")
+    await registrar(f'✅ <@{uid}> se verificou e ganhou o cargo **{painel.get("cargo_nome")}**.')
+
+
+# ── sorteios ──
+
+def _embed_sorteio(s: dict) -> dict:
+    fim = _ts(s["fim"])
+    linhas = [s["descricao"], ""] if s.get("descricao") else []
+    linhas.append(f'🏆 **Prêmio:** {s["premio"]}')
+    linhas.append(f'🥇 **Vencedores:** {s["vencedores"]}')
+    linhas.append(f'👥 **Participantes:** {len(s.get("participantes", []))}')
+    if s.get("cargo_obrigatorio_id"):
+        linhas.append(f'🔒 **Requisito:** ter o cargo <@&{s["cargo_obrigatorio_id"]}>')
+    if s["status"] == "ativo":
+        linhas.append(f"⏰ **Termina:** <t:{fim}:R> (<t:{fim}:f>)")
+        rodape = "Clique em Participar para entrar • boa sorte!"
+        cor = s.get("cor") or CORES["roxo"]
+    elif s["status"] == "cancelado":
+        linhas.append("❌ **Sorteio cancelado.**")
+        rodape, cor = "Sorteio cancelado", CORES["cinza"]
+    else:
+        linhas.append(f"⏰ **Encerrado:** <t:{fim}:f>")
+        ganh = s.get("ganhadores") or []
+        linhas.append("🎊 **Ganhador(es):** " + (", ".join(f"<@{g}>" for g in ganh) if ganh else "ninguém participou"))
+        rodape, cor = "Sorteio encerrado", CORES["cinza"]
+    embed: dict[str, Any] = {"title": s.get("titulo") or f'🎉 SORTEIO • {s["premio"]}'[:256],
+                             "description": "\n".join(linhas)[:4096], "color": cor, "footer": {"text": rodape}}
+    if s.get("imagem_url"):
+        embed["image"] = {"url": s["imagem_url"]}
+    if s.get("miniatura_url"):
+        embed["thumbnail"] = {"url": s["miniatura_url"]}
+    return embed
+
+
+def _botoes_sorteio(s: dict) -> dict:
+    if s["status"] == "ativo":
+        return _linha(_botao_painel(s.get("botao_texto") or "Participar", f'ecos:entrar:{s["id"]}', "verde", s.get("botao_emoji") or "🎉"))
+    rotulo = "Sorteio cancelado" if s["status"] == "cancelado" else "Sorteio encerrado"
+    return _linha({**_botao(rotulo, f'ecos:fim:{s["id"]}', 2, "🔒"), "disabled": True})
+
+
+async def _atualizar_mensagem_sorteio(s: dict) -> None:
+    """Reescreve o embed do sorteio mantendo a imagem que foi enviada junto da mensagem."""
+    embed = _embed_sorteio(s)
+    corpo: dict[str, Any] = {"embeds": [embed], "components": [_botoes_sorteio(s)]}
+    try:
+        atual = await dc("GET", f'/channels/{s["canal_id"]}/messages/{s["mensagem_id"]}')
+    except ErroDiscord as erro:
+        log.warning("Mensagem do sorteio %s sumiu: %s", s["id"], erro)
+        return
+    anexos = atual.get("attachments") or []
+    if anexos:
+        corpo["attachments"] = [{"id": a["id"]} for a in anexos]
+        for k in ("image", "thumbnail"):
+            arq = s.get(f"{k}_arquivo")
+            if arq and k in embed:
+                embed[k] = {"url": f"attachment://{arq}"}
+    await dc("PATCH", f'/channels/{s["canal_id"]}/messages/{s["mensagem_id"]}', corpo=corpo)
+
+
+def _atualizar_sorteio_depois(sid: str, segundos: float = 3) -> None:
+    tarefa = _tarefas_sorteio.get(sid)
+    if tarefa and not tarefa.done():
+        return
+
+    async def _rodar():
+        await asyncio.sleep(segundos)
+        s = _cfg.get("sorteios", {}).get(sid)
+        if s and s["status"] == "ativo":
+            try:
+                await _atualizar_mensagem_sorteio(s)
+            except Exception:
+                log.exception("Falha ao atualizar o sorteio %s", sid)
+
+    _tarefas_sorteio[sid] = asyncio.create_task(_rodar())
+
+
+async def _clique_sorteio(r: _Resposta, acao: str, sid: str) -> None:
+    inter = r.inter
+    if not _cfg_estado["carregada"]:
+        asyncio.create_task(garantir_config())
+        await r.efemera("O bot acabou de reiniciar. Tente de novo em alguns segundos.")
+        return
+    s = _cfg.get("sorteios", {}).get(sid)
+    if not s or s["status"] != "ativo" or datetime.fromisoformat(s["fim"]) <= _agora():
+        await r.efemera("Este sorteio já foi encerrado.")
+        return
+    uid = str(inter.user.id)
+    participantes: list[str] = s.setdefault("participantes", [])
+    if acao == "sair":
+        if uid in participantes:
+            participantes.remove(uid)
+            await r.enviar(7, {"content": "Você saiu do sorteio.", "components": []})
+            _atualizar_sorteio_depois(sid)
+            _salvar_depois()
+        else:
+            await r.enviar(7, {"content": "Você não estava participando.", "components": []})
+        return
+    if uid in participantes:
+        await r.enviar(4, {"content": "✅ Você já está participando deste sorteio. Boa sorte!", "flags": 64,
+                           "components": [_linha(_botao("Sair do sorteio", f"ecos:sair:{sid}", 4, "🚪"))]})
+        return
+    req = s.get("cargo_obrigatorio_id")
+    if req and req not in _ids_cargos(inter.user):
+        await r.efemera(f'Para participar, você precisa ter o cargo **{s.get("cargo_obrigatorio_nome") or "exigido"}**.')
+        return
+    participantes.append(uid)
+    await r.efemera(f'🎉 Você está participando do sorteio de **{s["premio"]}**! O resultado sai <t:{_ts(s["fim"])}:R>. Boa sorte!')
+    _atualizar_sorteio_depois(sid)
+    _salvar_depois()
+
+
+async def _sortear(s: dict, quantidade: int, excluir: set[str] | None = None) -> list[str]:
+    """Escolhe ganhadores ao acaso entre quem ainda está no servidor."""
+    gid = await servidor_id()
+    candidatos = [u for u in s.get("participantes", []) if u not in (excluir or set())]
+    random.SystemRandom().shuffle(candidatos)
+    ganhadores: list[str] = []
+    for uid in candidatos:
+        if len(ganhadores) >= quantidade:
+            break
+        try:
+            await dc("GET", f"/guilds/{gid}/members/{uid}")
+        except ErroDiscord as erro:
+            if erro.status == 404 or erro.codigo == 10007:
+                continue  # saiu do servidor
+            raise
+        ganhadores.append(uid)
+    return ganhadores
+
+
+async def _anunciar_ganhadores(s: dict, ganhadores: list[str], novo_sorteio: bool = False) -> None:
+    if ganhadores:
+        mencoes = ", ".join(f"<@{g}>" for g in ganhadores)
+        texto = (f'🎊 {"Novo sorteio! " if novo_sorteio else ""}Parabéns {mencoes}! '
+                 f'Você{"s" if len(ganhadores) > 1 else ""} ganhou **{s["premio"]}**! Abra um ticket para receber o prêmio.')
+    else:
+        texto = f'😕 O sorteio de **{s["premio"]}** terminou sem participantes válidos.'
+    await dc("POST", f'/channels/{s["canal_id"]}/messages', corpo={
+        "content": texto, "allowed_mentions": {"parse": [], "users": ganhadores},
+        "message_reference": {"message_id": s["mensagem_id"], "fail_if_not_exists": False}})
+
+
+async def finalizar_sorteio(s: dict) -> list[str]:
+    s["status"] = "sorteando"
+    try:
+        ganhadores = await _sortear(s, int(s["vencedores"]))
+    except Exception:
+        s["status"] = "ativo"
+        raise
+    s.update(status="encerrado", ganhadores=ganhadores, encerrado=_agora().isoformat())
+    if datetime.fromisoformat(s["fim"]) > _agora():
+        s["fim"] = _agora().isoformat()
+    await salvar_config()
+    try:
+        await _atualizar_mensagem_sorteio(s)
+    except ErroDiscord as erro:
+        log.warning("Não consegui atualizar a mensagem do sorteio: %s", erro)
+    await _anunciar_ganhadores(s, ganhadores)
+    await registrar(f'🎉 Sorteio **{s["premio"]}** encerrado. Ganhador(es): '
+                    + (", ".join(f"<@{g}>" for g in ganhadores) or "ninguém"))
+    return ganhadores
+
+
+async def rodar_sorteios() -> None:
+    if not _cfg_estado["carregada"]:
+        return
+    agora = _agora()
+    for s in list(_cfg.get("sorteios", {}).values()):
+        if s["status"] == "ativo" and datetime.fromisoformat(s["fim"]) <= agora:
+            try:
+                await finalizar_sorteio(s)
+            except Exception:
+                log.exception("Falha ao encerrar o sorteio %s", s.get("id"))
+    # esquece sorteios encerrados há mais de 30 dias
+    velhos = [k for k, s in _cfg.get("sorteios", {}).items()
+              if s["status"] in ("encerrado", "cancelado") and datetime.fromisoformat(s["fim"]) < agora - timedelta(days=30)]
+    if velhos:
+        for k in velhos:
+            _cfg["sorteios"].pop(k, None)
+        await salvar_config()
+
+
+async def _clique_loja(r: _Resposta, tipo: int, acao: str, partes: list[str]) -> None:
+    if tipo == 5:
+        if acao == "modal_pago":
+            await _modal_pago(r)
+    elif acao == "comprar":
+        await _clicou_comprar(r, partes[2] if len(partes) > 2 else "")
+    elif acao == "pago":
+        await _clicou_pago(r)
+    elif acao in ("aprovar", "recusar"):
+        await _decidir(r, acao == "aprovar")
+    elif acao in ("cancelar", "fechar"):
+        await _clicou_fechar(r, acao)
+
+
+async def _clique_ticket(r: _Resposta, acao: str, partes: list[str], dados: dict) -> None:
+    if acao == "abrir":
+        valores = dados.get("values") or []
+        await _abrir_ticket(r, partes[2] if len(partes) > 2 else "", valores[0] if valores else None)
+        return
+    if not _cfg_estado["carregada"]:
+        asyncio.create_task(garantir_config())
+        await r.efemera("O bot acabou de reiniciar. Tente de novo em alguns segundos.")
+        return
+    if acao == "assumir":
+        await _assumir_ticket(r)
+    elif acao == "fechar":
+        await _pedir_confirmacao_fechar(r)
+    elif acao == "confirmar":
+        await _confirmar_fechar(r)
+
+
 async def ao_interagir(inter: Any) -> None:
     dados = inter.data or {}
     cid = str(dados.get("custom_id") or "")
-    if not cid.startswith("ecop:"):
-        return
     partes = cid.split(":")
+    prefixo = partes[0]
+    if prefixo not in ("ecop", "ecot", "ecov", "ecos"):
+        return
     acao = partes[1] if len(partes) > 1 else ""
+    tipo = getattr(inter.type, "value", inter.type)   # 3 = botão/menu, 5 = formulário
     r = _Resposta(inter)
     try:
-        if inter.type == discord.InteractionType.modal_submit:
-            if acao == "modal_pago":
-                await _modal_pago(r)
-        elif acao == "comprar":
-            await _clicou_comprar(r, partes[2] if len(partes) > 2 else "")
-        elif acao == "pago":
-            await _clicou_pago(r)
-        elif acao in ("aprovar", "recusar"):
-            await _decidir(r, acao == "aprovar")
-        elif acao in ("cancelar", "fechar"):
-            await _clicou_fechar(r, acao)
+        if prefixo == "ecop":
+            await _clique_loja(r, tipo, acao, partes)
+        elif prefixo == "ecot":
+            await _clique_ticket(r, acao, partes, dados)
+        elif prefixo == "ecov":
+            await _verificar(r, acao)
+        elif prefixo == "ecos" and acao in ("entrar", "sair"):
+            await _clique_sorteio(r, acao, partes[2] if len(partes) > 2 else "")
     except Exception as erro:
         log.exception("Falha no botão %s", cid)
         texto = str(erro) if isinstance(erro, ErroDiscord) else "Deu um erro aqui. Tente de novo ou chame a equipe."
@@ -1690,7 +2437,8 @@ mcp = MCPServer(
         "Horários são de Brasília. Antes de qualquer ação que apaga, expulsa ou bane, confirme com o usuário "
         "e só então chame de novo com confirmado=true. Em boas-vindas e respostas automáticas, os textos "
         "aceitam {usuario} (menciona a pessoa), {nome}, {servidor} e {membros}. "
-        "As automações rodam no próprio bot, mesmo com o Claude fechado."
+        "As automações rodam no próprio bot, mesmo com o Claude fechado. Para trocar painéis de outro bot "
+        "(ticket, verificação, sorteio), leia com ver_mensagem e publique de novo com copiar_de apontando para a mensagem antiga."
     ),
     version=VERSAO,
 )
@@ -2042,7 +2790,8 @@ async def agendar_mensagem(canal_id: str, quando: str, texto: str | None = None,
     Roda no próprio bot, mesmo com o Claude fechado."""
     await exigir_config()
     canal = await achar_canal(canal_id, tipos=TIPOS_MENSAGEM)
-    payload = montar_mensagem(texto, titulo, descricao, cor, imagem_url, None, rodape, botao_texto, botao_link, mencionar_todos)
+    payload = montar_mensagem(texto, titulo, descricao, cor, await _guardar_imagem(imagem_url), None, rodape,
+                              botao_texto, botao_link, mencionar_todos)
     rep = REPETICOES.get(_norm(repetir))
     if rep is None:
         raise ErroDiscord('repetir deve ser: nao, diario, semanal, dias_uteis ou minutos.')
@@ -2089,6 +2838,21 @@ async def listar_automacoes() -> dict:
             {"id": c["id"], "emoji": c["emoji_exibir"], "cargo": c["cargo_nome"], "canal": c.get("canal_nome"),
              "mensagem_id": c["mensagem_id"]} for c in _cfg["cargos_reacao"]],
         "registros": f'#{lg.get("canal_nome")}' if lg.get("ativo") else "desligado",
+        "paineis": [
+            {"id": p["id"], "tipo": "ticket" if p["tipo"] == "ticket" else "verificação", "canal": p.get("canal_nome"),
+             **({"cargo": p.get("cargo_nome")} if p["tipo"] == "verificacao" else
+                {"tickets_em": p.get("categoria_nome"), "equipe": [c["nome"] for c in p.get("cargos_equipe", [])],
+                 "historico_em": p.get("canal_historico_nome")})} for p in _cfg.get("paineis", {}).values()],
+        "tickets_abertos": [
+            {"canal": f"<#{cid}>", "numero": t.get("numero"), "dono": t.get("dono_nome"), "assunto": t.get("motivo"),
+             "atendido_por": t.get("assumido_nome"), "aberto": _fmt(t.get("aberto"))}
+            for cid, t in _cfg.get("tickets", {}).items()],
+        "sorteios": [
+            {"id": x["id"], "premio": x["premio"], "canal": x.get("canal_nome"), "status": x["status"],
+             "participantes": len(x.get("participantes", [])),
+             ("termina" if x["status"] == "ativo" else "terminou"): _fmt(x["fim"]),
+             **({"ganhadores": [f"<@{g}>" for g in x.get("ganhadores", [])]} if x["status"] == "encerrado" else {})}
+            for x in sorted(_cfg.get("sorteios", {}).values(), key=lambda x: x["fim"], reverse=True)],
     }
     if not _cfg_estado["carregada"]:
         resultado["aviso"] = _cfg_estado["aviso"] or "Memória ainda não carregada."
@@ -2097,9 +2861,16 @@ async def listar_automacoes() -> dict:
 
 @mcp.tool(annotations=DESTRUTIVA)
 async def remover_automacao(automacao_id: str) -> str:
-    """Remove uma mensagem agendada, resposta automática ou cargo por reação pelo ID (veja listar_automacoes)."""
+    """Remove uma mensagem agendada, resposta automática, cargo por reação ou painel (ticket/verificação) pelo ID
+    (veja listar_automacoes). Remover um painel desliga o botão dele; a mensagem continua no canal."""
     await exigir_config()
     alvo = automacao_id.strip().strip("`")
+    if alvo in _cfg.get("paineis", {}):
+        p = _cfg["paineis"].pop(alvo)
+        await salvar_config()
+        return f'✅ Painel de {"ticket" if p["tipo"] == "ticket" else "verificação"} {alvo} desligado (a mensagem em #{p.get("canal_nome")} continua lá; apague se quiser).'
+    if alvo in _cfg.get("sorteios", {}):
+        raise ErroDiscord("Para sorteios use encerrar_sorteio ou cancelar_sorteio.")
     for lista, rotulo in (("agendadas", "Mensagem agendada"), ("respostas", "Resposta automática"),
                           ("cargos_reacao", "Cargo por reação")):
         for item in _cfg[lista]:
@@ -2124,7 +2895,7 @@ async def configurar_boas_vindas(canal_id: str | None = None, texto: str | None 
         await salvar_config()
         return {"ok": True, "boas_vindas": "desligado"}
     conf: dict[str, Any] = {"ativo": True, "texto": texto, "titulo": titulo, "descricao": descricao,
-                            "cor": cor, "imagem_url": imagem_url, "mandar_dm": mandar_dm}
+                            "cor": cor, "imagem_url": await _guardar_imagem(imagem_url), "mandar_dm": mandar_dm}
     if canal_id:
         canal = await achar_canal(canal_id, tipos=TIPOS_MENSAGEM)
         conf.update(canal_id=canal["id"], canal_nome=canal["name"])
@@ -2636,10 +3407,7 @@ async def publicar_painel_compra(canal_id: str, produto: str, mensagem_id: str |
                                     "nome completo e o produto chega na sua DM assim que a equipe confirmar."),
             cor=cor, imagem_url=imagem_url, miniatura_url=miniatura_url, rodape=rodape or "ECO PULSE • Compra segura")
         payload["components"] = [botoes]
-    if mensagem_id:
-        msg = await dc("PATCH", f'/channels/{canal["id"]}/messages/{mensagem_id}', corpo=payload)
-    else:
-        msg = await dc("POST", f'/channels/{canal["id"]}/messages', corpo=payload)
+    msg = await _postar(canal["id"], payload, editar_id=mensagem_id)
     prod["painel"] = {"canal_id": canal["id"], "mensagem_id": msg["id"]}
     await salvar_config()
     return {"ok": True, "mensagem_id": msg["id"], "link": _link_canal(await servidor_id(), canal["id"], msg["id"])}
@@ -2660,6 +3428,283 @@ async def ver_loja() -> dict:
                 "aberta_em": _fmt(c["criado"])} for cid, c in _cfg.get("compras", {}).items()]
     return {"pix": "configurado" if (PIX_CHAVE or PIX_COPIA_COLA) else "não configurado (variável PIX_CHAVE no Render)",
             "produtos": produtos, "compras_em_andamento": compras}
+
+
+# ── leitura detalhada ──
+
+@mcp.tool(annotations=LEITURA)
+async def ver_mensagem(mensagem: str, canal_id: str | None = None) -> dict:
+    """Mostra uma mensagem por completo: texto, embeds inteiros (título, descrição, campos, cor, imagens, rodapé),
+    botões e menus (texto, emoji e cor de cada um) e anexos. Use para copiar painéis de outros bots.
+    mensagem = link da mensagem, "canal_id/mensagem_id" ou só o ID (passando canal_id)."""
+    m = await _buscar_mensagem(mensagem, canal_id)
+    resultado: dict[str, Any] = {
+        "id": m["id"], "canal_id": m["channel_id"], "autor": m["author"].get("global_name") or m["author"]["username"],
+        "autor_id": m["author"]["id"], "autor_e_bot": bool(m["author"].get("bot")), "quando": _fmt(m["timestamp"]),
+        "texto": m.get("content") or "",
+        "embeds": [{**_limpar_embed(e), **({"cor_hex": f'#{e["color"]:06x}'} if e.get("color") is not None else {})}
+                   for e in m.get("embeds", [])],
+        "botoes_e_menus": _resumo_componentes(m.get("components", [])),
+        "anexos": [{"nome": a["filename"], "url": a["url"], "tipo": a.get("content_type")} for a in m.get("attachments", [])],
+    }
+    if m.get("pinned"):
+        resultado["fixada"] = True
+    if m["author"]["id"] != (await eu())["id"] and resultado["botoes_e_menus"]:
+        resultado["obs"] = ("Os botões desta mensagem pertencem a outro bot e param de funcionar quando ele sai. "
+                            "Para trocar, publique um painel novo com copiar_de apontando para esta mensagem.")
+    return resultado
+
+
+@mcp.tool(annotations=LEITURA)
+async def info_canal(canal_id: str) -> dict:
+    """Detalhes de um canal: tópico, categoria, modo lento e quem pode ver/escrever (permissões por cargo e membro)."""
+    canal = await achar_canal(canal_id)
+    gid = await servidor_id()
+    cargos = {c["id"]: c["name"] for c in await _cargos()}
+    info: dict[str, Any] = {"id": canal["id"], "nome": canal["name"], "tipo": TIPOS.get(canal["type"], str(canal["type"]))}
+    if canal.get("topic"):
+        info["topico"] = canal["topic"]
+    if canal.get("parent_id"):
+        try:
+            info["categoria"] = (await dc("GET", f'/channels/{canal["parent_id"]}'))["name"]
+        except ErroDiscord:
+            info["categoria"] = canal["parent_id"]
+    if canal.get("rate_limit_per_user"):
+        info["modo_lento_segundos"] = canal["rate_limit_per_user"]
+    regras = []
+    for o in canal.get("permission_overwrites", []):
+        alvo = "@everyone" if o["id"] == gid else (f'@{cargos.get(o["id"], o["id"])}' if o["type"] == 0 else f'membro <@{o["id"]}>')
+        regras.append({"alvo": alvo, "permitido": _nomes_perm(int(o["allow"])), "negado": _nomes_perm(int(o["deny"]))})
+    info["permissoes"] = regras or "segue a categoria/servidor"
+    return info
+
+
+# ── tickets ──
+
+@mcp.tool()
+async def publicar_painel_ticket(canal_id: str, titulo: str | None = None, descricao: str | None = None,
+                                 cor: str | None = None, imagem_url: str | None = None, miniatura_url: str | None = None,
+                                 rodape: str | None = None, botao_texto: str = "Abrir ticket", botao_emoji: str | None = "🎫",
+                                 botao_cor: str = "azul", motivos: list[str] | None = None, categoria: str | None = None,
+                                 cargos_equipe: list[str] | None = None, canal_historico: str | None = None,
+                                 mensagem_abertura: str | None = None, avisar_equipe: bool = True,
+                                 copiar_de: str | None = None, mensagem_id: str | None = None) -> dict:
+    """Publica o painel de suporte: quem clica ganha um canal privado só com a equipe (o ticket), com botões
+    para a equipe assumir e para fechar. Ao fechar, o histórico vai em .txt para canal_historico e para a DM da pessoa.
+    motivos = assuntos para escolher num menu (ex.: ["Dúvida", "Compra", "Problema"]); sem motivos vira um botão.
+    categoria = onde os tickets são criados. cargos_equipe = quem atende (nomes ou IDs).
+    mensagem_abertura aceita {usuario} e {nome}. copiar_de = link/ID de outra mensagem (ex.: painel de outro bot)
+    para reaproveitar título, texto, cor e imagens; o que você passar por cima substitui.
+    mensagem_id = atualizar um painel deste bot que já existe em vez de publicar outro."""
+    await exigir_config()
+    canal = await achar_canal(canal_id, tipos=TIPOS_MENSAGEM)
+    embed, texto = await _montar_painel(
+        copiar_de=copiar_de, titulo=titulo, descricao=descricao, cor=cor, imagem_url=imagem_url,
+        miniatura_url=miniatura_url, rodape=rodape, titulo_padrao="🎫 Suporte",
+        descricao_padrao="Precisa de ajuda? Clique no botão abaixo para abrir um ticket. Só você e a equipe vão ver a conversa.")
+    pid = next((k for k, p in _cfg["paineis"].items() if mensagem_id and p.get("mensagem_id") == mensagem_id), None) \
+        or secrets.token_hex(3)
+    painel: dict[str, Any] = {"id": pid, "tipo": "ticket", "canal_id": canal["id"], "canal_nome": canal["name"],
+                              "avisar_equipe": avisar_equipe, "cor": embed.get("color")}
+    if categoria:
+        cat = await achar_categoria(categoria)
+        painel.update(categoria_id=cat["id"], categoria_nome=cat["name"])
+    painel["cargos_equipe"] = [{"id": c["id"], "nome": c["name"]} for c in [await achar_cargo(x) for x in (cargos_equipe or [])]]
+    if canal_historico:
+        h = await achar_canal(canal_historico, tipos=TIPOS_MENSAGEM)
+        painel.update(canal_historico_id=h["id"], canal_historico_nome=h["name"])
+    if mensagem_abertura:
+        painel["mensagem_abertura"] = mensagem_abertura[:3500]
+    motivos = [m.strip()[:100] for m in (motivos or []) if m and m.strip()][:25]
+    if motivos:
+        painel["motivos"] = motivos
+        componente = {"type": 1, "components": [{
+            "type": 3, "custom_id": f"ecot:abrir:{pid}", "placeholder": (botao_texto or "Escolha o assunto")[:150],
+            "options": [{"label": m, "value": str(i), **({"emoji": _emoji_botao(botao_emoji)} if botao_emoji else {})}
+                        for i, m in enumerate(motivos)]}]}
+    else:
+        componente = _linha(_botao_painel(botao_texto, f"ecot:abrir:{pid}", botao_cor, botao_emoji))
+    payload: dict[str, Any] = {"embeds": [embed], "components": [componente], "allowed_mentions": {"parse": []}}
+    if texto:
+        payload["content"] = texto
+    msg = await _postar(canal["id"], payload, editar_id=mensagem_id)
+    painel["mensagem_id"] = msg["id"]
+    _cfg["paineis"][pid] = painel
+    await salvar_config()
+    return {"ok": True, "painel_id": pid, "canal": canal["name"], "mensagem_id": msg["id"],
+            "link": _link_canal(await servidor_id(), canal["id"], msg["id"]),
+            "tickets_em": painel.get("categoria_nome") or "fora de categoria",
+            "equipe": [c["nome"] for c in painel["cargos_equipe"]] or "só administradores",
+            "historico_em": painel.get("canal_historico_nome") or ("canal de registros" if (_cfg.get("logs") or {}).get("ativo") else "nenhum")}
+
+
+@mcp.tool(annotations=DESTRUTIVA)
+async def fechar_ticket(canal_id: str, confirmado: bool = False) -> str:
+    """Fecha um ticket aberto: salva o histórico, avisa a pessoa por DM e apaga o canal.
+    Só chame com confirmado=true depois que o usuário confirmar."""
+    await exigir_config()
+    canal = await achar_canal(canal_id)
+    t = _cfg["tickets"].get(canal["id"])
+    if not t:
+        raise ErroDiscord(f'#{canal["name"]} não é um ticket aberto por este bot.')
+    if not confirmado:
+        return f'⚠️ Nada foi fechado. Confirme com o usuário que ele quer fechar o ticket #{canal["name"]} de {t.get("dono_nome")}. Depois chame com confirmado=true.'
+    await dc("POST", f'/channels/{canal["id"]}/messages', corpo={
+        "content": f"🔒 Ticket fechado pela equipe. O histórico foi salvo e este canal some em {FECHAR_TICKET_EM} segundos."})
+    await encerrar_ticket(canal["id"], None, "a equipe (pelo Claude)")
+    return f'✅ Ticket #{canal["name"]} fechado e histórico salvo.'
+
+
+# ── verificação ──
+
+@mcp.tool()
+async def publicar_painel_verificacao(canal_id: str, cargo: str, titulo: str | None = None, descricao: str | None = None,
+                                      cor: str | None = None, imagem_url: str | None = None, miniatura_url: str | None = None,
+                                      rodape: str | None = None, botao_texto: str = "Verificar", botao_emoji: str | None = "✅",
+                                      botao_cor: str = "verde", tirar_cargo: str | None = None,
+                                      mensagem_sucesso: str | None = None, copiar_de: str | None = None,
+                                      mensagem_id: str | None = None) -> dict:
+    """Publica o painel de verificação: quem clica no botão ganha o cargo (ex.: Membro) e passa a ver o servidor.
+    tirar_cargo = cargo de "não verificado" para remover ao verificar. copiar_de = link/ID de outra mensagem
+    para reaproveitar o visual. mensagem_id = atualizar um painel deste bot que já existe."""
+    await exigir_config()
+    canal = await achar_canal(canal_id, tipos=TIPOS_MENSAGEM)
+    c = await achar_cargo(cargo)
+    if c["id"] == await servidor_id() or c.get("managed"):
+        raise ErroDiscord("Esse cargo não pode ser dado pela verificação.")
+    embed, texto = await _montar_painel(
+        copiar_de=copiar_de, titulo=titulo, descricao=descricao, cor=cor, imagem_url=imagem_url,
+        miniatura_url=miniatura_url, rodape=rodape, titulo_padrao="🔐 Verificação",
+        descricao_padrao="Clique no botão abaixo para se verificar e liberar o acesso ao servidor.")
+    pid = next((k for k, p in _cfg["paineis"].items() if mensagem_id and p.get("mensagem_id") == mensagem_id), None) \
+        or secrets.token_hex(3)
+    painel: dict[str, Any] = {"id": pid, "tipo": "verificacao", "canal_id": canal["id"], "canal_nome": canal["name"],
+                              "cargo_id": c["id"], "cargo_nome": c["name"]}
+    if tirar_cargo:
+        t = await achar_cargo(tirar_cargo)
+        painel.update(tirar_cargo_id=t["id"], tirar_cargo_nome=t["name"])
+    if mensagem_sucesso:
+        painel["mensagem_sucesso"] = mensagem_sucesso[:1500]
+    payload: dict[str, Any] = {"embeds": [embed], "allowed_mentions": {"parse": []},
+                               "components": [_linha(_botao_painel(botao_texto, f"ecov:{pid}", botao_cor, botao_emoji))]}
+    if texto:
+        payload["content"] = texto
+    msg = await _postar(canal["id"], payload, editar_id=mensagem_id)
+    painel["mensagem_id"] = msg["id"]
+    _cfg["paineis"][pid] = painel
+    await salvar_config()
+    return {"ok": True, "painel_id": pid, "canal": canal["name"], "cargo": c["name"], "mensagem_id": msg["id"],
+            "link": _link_canal(await servidor_id(), canal["id"], msg["id"])}
+
+
+# ── sorteios ──
+
+@mcp.tool()
+async def criar_sorteio(canal_id: str, premio: str, termina: str, vencedores: int = 1, descricao: str | None = None,
+                        titulo: str | None = None, cor: str | None = None, imagem_url: str | None = None,
+                        cargo_obrigatorio: str | None = None, mencionar_todos: bool = False,
+                        botao_texto: str = "Participar", botao_emoji: str | None = "🎉",
+                        copiar_de: str | None = None) -> dict:
+    """Cria um sorteio com botão Participar. Quando chega a hora, o bot sorteia sozinho, anuncia e marca os ganhadores
+    (mesmo com o Claude fechado). termina: "daqui a 3 dias", "30/10 20:00", "2026-11-05 18:00", "amanhã 20h"
+    (horário de Brasília). cargo_obrigatorio = só quem tem o cargo participa. copiar_de = link/ID de outra mensagem
+    (ex.: sorteio de outro bot) para reaproveitar título, texto e imagem."""
+    await exigir_config()
+    canal = await achar_canal(canal_id, tipos=TIPOS_MENSAGEM)
+    fim = _ler_quando(termina)
+    agora = _agora()
+    if fim.astimezone(timezone.utc) <= agora + timedelta(minutes=1):
+        raise ErroDiscord(f"O fim do sorteio ({_fmt(fim)}) precisa ser no futuro.")
+    if fim.astimezone(timezone.utc) > agora + timedelta(days=60):
+        raise ErroDiscord("O sorteio pode durar no máximo 60 dias.")
+    vencedores = max(1, min(20, int(vencedores)))
+    base: dict[str, Any] = {}
+    if copiar_de:
+        base, _ = await _montar_painel(copiar_de=copiar_de, titulo=None, descricao=None, cor=None, imagem_url=None,
+                                       miniatura_url=None, rodape=None, titulo_padrao="", descricao_padrao="")
+    sid = secrets.token_hex(3)
+    s: dict[str, Any] = {
+        "id": sid, "canal_id": canal["id"], "canal_nome": canal["name"], "premio": premio[:200],
+        "titulo": (titulo or base.get("title") or None), "descricao": descricao if descricao is not None else (base.get("description") or None),
+        "vencedores": vencedores, "fim": fim.astimezone(timezone.utc).isoformat(), "status": "ativo",
+        "participantes": [], "ganhadores": [], "cor": _cor(cor) if cor else base.get("color"),
+        "imagem_url": imagem_url or (base.get("image") or {}).get("url"),
+        "miniatura_url": (base.get("thumbnail") or {}).get("url"),
+        "botao_texto": botao_texto, "botao_emoji": botao_emoji, "criado": agora.isoformat(),
+    }
+    if s["descricao"] and len(s["descricao"]) > 3500:
+        raise ErroDiscord("A descrição do sorteio passou de 3500 caracteres.")
+    if cargo_obrigatorio:
+        c = await achar_cargo(cargo_obrigatorio)
+        s.update(cargo_obrigatorio_id=c["id"], cargo_obrigatorio_nome=c["name"])
+    payload: dict[str, Any] = {"embeds": [_embed_sorteio(s)], "components": [_botoes_sorteio(s)],
+                               "allowed_mentions": {"parse": ["everyone"] if mencionar_todos else []}}
+    if mencionar_todos:
+        payload["content"] = "@everyone"
+    msg = await _postar(canal["id"], payload)
+    s["mensagem_id"] = msg["id"]
+    nomes = {a["filename"] for a in msg.get("attachments", [])}
+    for k in ("image", "thumbnail"):
+        url = ((msg.get("embeds") or [{}])[0].get(k) or {}).get("url") or ""
+        arq = url.split("?")[0].rsplit("/", 1)[-1]
+        if arq in nomes:
+            s[f"{k}_arquivo"] = arq
+    _cfg["sorteios"][sid] = s
+    await salvar_config()
+    return {"ok": True, "sorteio_id": sid, "canal": canal["name"], "premio": s["premio"], "termina": _fmt(fim),
+            "vencedores": vencedores, "link": _link_canal(await servidor_id(), canal["id"], msg["id"])}
+
+
+def _achar_sorteio(sorteio_id: str) -> dict:
+    s = _cfg.get("sorteios", {}).get(str(sorteio_id).strip().strip("`"))
+    if not s:
+        raise ErroDiscord(f"Não achei o sorteio {sorteio_id}. Use listar_automacoes para ver os IDs.")
+    return s
+
+
+@mcp.tool()
+async def encerrar_sorteio(sorteio_id: str) -> dict:
+    """Termina um sorteio agora: sorteia os ganhadores, anuncia no canal e atualiza a mensagem."""
+    await exigir_config()
+    s = _achar_sorteio(sorteio_id)
+    if s["status"] != "ativo":
+        raise ErroDiscord("Esse sorteio não está mais ativo. Para escolher outro ganhador, use sortear_de_novo.")
+    ganhadores = await finalizar_sorteio(s)
+    return {"ok": True, "premio": s["premio"], "participantes": len(s.get("participantes", [])),
+            "ganhadores": [f"<@{g}>" for g in ganhadores] or "ninguém participou"}
+
+
+@mcp.tool()
+async def sortear_de_novo(sorteio_id: str, vencedores: int = 1) -> dict:
+    """Escolhe novo(s) ganhador(es) de um sorteio já encerrado (ex.: o ganhador não respondeu), sem repetir os anteriores."""
+    await exigir_config()
+    s = _achar_sorteio(sorteio_id)
+    if s["status"] != "encerrado":
+        raise ErroDiscord("Só dá para sortear de novo um sorteio já encerrado.")
+    anteriores = set(s.get("ganhadores", [])) | set(s.get("ja_sorteados", []))
+    novos = await _sortear(s, max(1, min(20, int(vencedores))), anteriores)
+    s["ja_sorteados"] = sorted(anteriores)
+    s["ganhadores"] = novos or s.get("ganhadores", [])
+    await salvar_config()
+    if novos:
+        await _atualizar_mensagem_sorteio(s)
+    await _anunciar_ganhadores(s, novos, novo_sorteio=True)
+    return {"ok": True, "novos_ganhadores": [f"<@{g}>" for g in novos] or "não sobrou ninguém para sortear"}
+
+
+@mcp.tool(annotations=DESTRUTIVA)
+async def cancelar_sorteio(sorteio_id: str, confirmado: bool = False) -> str:
+    """Cancela um sorteio ativo sem escolher ganhador. Só chame com confirmado=true depois que o usuário confirmar."""
+    await exigir_config()
+    s = _achar_sorteio(sorteio_id)
+    if s["status"] != "ativo":
+        raise ErroDiscord("Esse sorteio não está ativo.")
+    if not confirmado:
+        return f'⚠️ Nada foi cancelado. Confirme com o usuário que ele quer cancelar o sorteio de "{s["premio"]}" ({len(s.get("participantes", []))} participantes). Depois chame com confirmado=true.'
+    s["status"] = "cancelado"
+    await salvar_config()
+    await _atualizar_mensagem_sorteio(s)
+    return f'✅ Sorteio de "{s["premio"]}" cancelado.'
 
 
 # ── servidor ──
@@ -2708,6 +3753,11 @@ async def status_agente() -> dict:
         "protegido_por_chave": bool(CHAVE),
         "loja": {"pix": "configurado" if (PIX_CHAVE or PIX_COPIA_COLA) else "não configurado",
                  "produtos": len(_cfg.get("produtos", {})), "compras_em_andamento": len(_cfg.get("compras", {}))},
+        "comunidade": {
+            "paineis_ticket": len([p for p in _cfg.get("paineis", {}).values() if p["tipo"] == "ticket"]),
+            "tickets_abertos": len(_cfg.get("tickets", {})),
+            "paineis_verificacao": len([p for p in _cfg.get("paineis", {}).values() if p["tipo"] == "verificacao"]),
+            "sorteios_ativos": len([x for x in _cfg.get("sorteios", {}).values() if x["status"] == "ativo"])},
     }
     if _bot_estado.get("servidores"):
         status["servidores_do_bot"] = _bot_estado["servidores"]
@@ -2746,6 +3796,7 @@ async def ciclo_de_vida(app):
         finally:
             for t in tarefas:
                 t.cancel()
+            await _salvar_pendente()
             if _bot is not None:
                 try:
                     await _bot.close()
