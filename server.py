@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "4.1"
+VERSAO = "4.2"
 INICIO = time.time()
 
 
@@ -4509,6 +4509,9 @@ CREATE INDEX IF NOT EXISTS pedidos_usuario ON pedidos (usuario_id, status);
 CREATE TABLE IF NOT EXISTS entregas_config (
     jogo TEXT NOT NULL, plano TEXT NOT NULL, instrucoes TEXT, login_cifrado TEXT, link_download TEXT,
     atualizado_por TEXT, atualizado_em TEXT, PRIMARY KEY (jogo, plano));
+CREATE TABLE IF NOT EXISTS entregas_arquivos (
+    jogo TEXT NOT NULL, plano TEXT NOT NULL, nome TEXT NOT NULL, canal_id TEXT NOT NULL, mensagem_id TEXT NOT NULL,
+    tamanho INTEGER, adicionado_por TEXT, adicionado_em TEXT, PRIMARY KEY (jogo, plano, nome));
 CREATE TABLE IF NOT EXISTS auditoria (
     id INTEGER PRIMARY KEY AUTOINCREMENT, quando TEXT NOT NULL, pedido_id TEXT, ator_id TEXT, acao TEXT NOT NULL,
     detalhe TEXT);
@@ -4579,6 +4582,12 @@ def _abrir_db(caminho: str) -> sqlite3.Connection:
     for nome, tipo in (("arquivo_canal", "TEXT"), ("arquivo_msg", "TEXT"), ("arquivo_nome", "TEXT"), ("arquivo_tamanho", "INTEGER")):
         if nome not in colunas:  # bancos antigos (restaurados do backup) ganham as colunas novas
             conn.execute(f"ALTER TABLE entregas_config ADD COLUMN {nome} {tipo}")
+    # versão 4.0 guardava 1 arquivo por plano em entregas_config: passa para a tabela de vários arquivos
+    conn.execute("INSERT OR IGNORE INTO entregas_arquivos (jogo, plano, nome, canal_id, mensagem_id, tamanho, adicionado_por, "
+                 "adicionado_em) SELECT jogo, plano, arquivo_nome, arquivo_canal, arquivo_msg, arquivo_tamanho, atualizado_por, "
+                 "atualizado_em FROM entregas_config WHERE arquivo_msg IS NOT NULL")
+    conn.execute("UPDATE entregas_config SET arquivo_canal = NULL, arquivo_msg = NULL, arquivo_nome = NULL, arquivo_tamanho = NULL "
+                 "WHERE arquivo_msg IS NOT NULL")
     return conn
 
 
@@ -5509,15 +5518,21 @@ async def _executar_entrega(p: sqlite3.Row, key_row: sqlite3.Row | None) -> None
     if cfg and cfg["link_download"]:
         instrucoes.append(f'⬇️ **Download:** {cfg["link_download"]}')
     login = decifrar(cfg["login_cifrado"]) if cfg and cfg["login_cifrado"] else None
-    cfg_arquivo = _arquivo_entrega(p["jogo"], p["plano"])
-    arquivo = await _baixar_arquivo_entrega(cfg_arquivo) if cfg_arquivo else None
-    if cfg_arquivo and not arquivo:
+    arquivos, faltando = [], []
+    for cfg_arquivo in _arquivos_entrega(p["jogo"], p["plano"]):
+        baixado = await _baixar_arquivo_entrega(cfg_arquivo)
+        if baixado:
+            arquivos.append(baixado)
+        else:
+            faltando.append(cfg_arquivo["nome"])
+    if faltando:
         aviso_arquivo = (f'⚠️ **Arquivo de entrega não foi** no pedido `{pid}` (<@{uid}>): não achei '
-                         f'`{cfg_arquivo["arquivo_nome"]}` no canal de arquivos. Mande pelo canal <#{canal_id}> e '
+                         + ", ".join(f"`{n}`" for n in faltando) + f' no canal de arquivos. Mande pelo canal <#{canal_id}> e '
                          "configure de novo com `/entrega_configurar` + arquivo.")
         if not await alertar_equipe(aviso_arquivo):
             await registrar_venda_log(aviso_arquivo)
-    abaixo = [x for x, tem in (("o passo a passo", instrucoes), ("o arquivo", arquivo), ("o login", login), ("a key", key_row)) if tem]
+    rotulo_arq = "o arquivo" if len(arquivos) == 1 else "os arquivos"
+    abaixo = [x for x, tem in (("o passo a passo", instrucoes), (rotulo_arq, arquivos), ("o login", login), ("a key", key_row)) if tem]
     resumo = (f'🎮 **{_rotulo_jogo(j)}**  •  📦 **{p["produto_nome"]}**  •  ⏳ {_duracao(p["dias"])}\n'
               f'🆔 `{pid}`  •  💰 {_reais_c(p["preco_centavos"])}')
     aviso = ("\n\n" + (", ".join(abaixo[:-1]) + " e " + abaixo[-1] if len(abaixo) > 1 else abaixo[0]).capitalize()
@@ -5530,7 +5545,7 @@ async def _executar_entrega(p: sqlite3.Row, key_row: sqlite3.Row | None) -> None
                     "footer": {"text": "ECO CHEATS • Obrigado pela compra!"}}]}]
     if instrucoes:
         mensagens.append({"embeds": [{"title": "📖 Passo a passo", "color": NEON, "description": "\n\n".join(instrucoes)[:4096]}]})
-    if arquivo:
+    for arquivo in arquivos:
         mensagens.append({"content": f"📎 **{arquivo[0]}**", "_arquivo": arquivo})
     if login:
         mensagens.append({"embeds": [{"title": "🔐 Seu login", "color": NEON, "description": login[:4096]}]})
@@ -5704,7 +5719,9 @@ COMANDOS_VENDAS: list[dict[str, Any]] = [
      "default_member_permissions": "8",
      "options": [_OP_JOGO, _opcional(_OP_PLANO, "Plano (vazio = vale para todos os planos do jogo)"),
                  {"type": 11, "name": "arquivo", "description": "Arquivo que vai junto em toda entrega (até 10 MB)", "required": False},
-                 {"type": 5, "name": "remover_arquivo", "description": "Tirar o arquivo das próximas entregas", "required": False}]},
+                 {"type": 11, "name": "arquivo2", "description": "Mais um arquivo (opcional)", "required": False},
+                 {"type": 11, "name": "arquivo3", "description": "Mais um arquivo (opcional)", "required": False},
+                 {"type": 5, "name": "remover_arquivo", "description": "Tirar TODOS os arquivos deste jogo/plano", "required": False}]},
     {"name": "pedido_consultar", "description": "Consultar um pedido", "type": 1, "default_member_permissions": "8",
      "options": [{"type": 3, "name": "pedido", "description": "ID do pedido (ECO-…)", "required": True, "autocomplete": True}]},
     {"name": "painel_vendas_publicar", "description": "Publicar ou atualizar os cinco painéis de venda", "type": 1,
@@ -5892,7 +5909,7 @@ async def ao_comando_vendas(r: _Resposta, nome: str, op: dict, dados: dict) -> N
             await r.efemera("⛔ Só o cargo **FUNDADOR** pode usar este comando.")
             return
         jid, plano = op["jogo"], op.get("plano") or "*"
-        if op.get("arquivo") or op.get("remover_arquivo"):
+        if op.get("arquivo") or op.get("arquivo2") or op.get("arquivo3") or op.get("remover_arquivo"):
             await r.adiar()
             await _configurar_arquivo_entrega(r, jid, plano, dados, bool(op.get("remover_arquivo")))
             return
@@ -6159,61 +6176,96 @@ def _mb(n: int) -> str:
     return f"{n / 1024 / 1024:.1f} MB".replace(".", ",")
 
 
+MAX_ARQUIVOS_ENTREGA = 5
+_OPCOES_ARQUIVO = ("arquivo", "arquivo2", "arquivo3")
+
+
+def _lista_arquivos(jid: str, plano: str) -> list[sqlite3.Row]:
+    return _q("SELECT * FROM entregas_arquivos WHERE jogo = ? AND plano = ? ORDER BY adicionado_em, rowid", (jid, plano))
+
+
 async def _configurar_arquivo_entrega(r: _Resposta, jid: str, plano: str, dados: dict, remover: bool) -> None:
     quem = str(r.inter.user.id)
     j = _jogo(jid)
     alvo = "todos os planos" if plano == "*" else _produto(jid, plano)["nome"]
-    if remover:
+    resolvidos = (dados.get("resolved") or {}).get("attachments") or {}
+    anexos = []
+    for o in dados.get("options", []):
+        if o["name"] in _OPCOES_ARQUIVO and str(o.get("value")) in resolvidos:
+            anexos.append(resolvidos[str(o["value"])])
+    if remover and not anexos:
         with _tx() as conn:
-            n = conn.execute("UPDATE entregas_config SET arquivo_canal = NULL, arquivo_msg = NULL, arquivo_nome = NULL, "
-                             "arquivo_tamanho = NULL, atualizado_por = ?, atualizado_em = ? WHERE jogo = ? AND plano = ?",
-                             (quem, _agora_iso(), jid, plano)).rowcount
-            _auditar(conn, "arquivo_entrega_removido", None, quem, f"{jid}/{plano}")
-        await r.efemera(f"🗑️ Arquivo tirado das próximas entregas de {_rotulo_jogo(j)} ({alvo})." if n
+            n = conn.execute("DELETE FROM entregas_arquivos WHERE jogo = ? AND plano = ?", (jid, plano)).rowcount
+            _auditar(conn, "arquivos_entrega_removidos", None, quem, f"{jid}/{plano}: {n}")
+        await r.efemera(f"🗑️ {n} arquivo(s) tirado(s) das próximas entregas de {_rotulo_jogo(j)} ({alvo})." if n
                         else f"Não havia arquivo configurado para {_rotulo_jogo(j)} ({alvo}).")
         return
-    valor = next((o.get("value") for o in dados.get("options", []) if o["name"] == "arquivo"), None)
-    anexo = ((dados.get("resolved") or {}).get("attachments") or {}).get(str(valor))
-    if not anexo:
+    if not anexos:
         await r.efemera("Não recebi o arquivo. Tente anexar de novo.")
         return
     limite = await _limite_upload()
-    if (anexo.get("size") or 0) > limite:
-        await r.efemera(f'O arquivo tem {_mb(anexo["size"])} e o bot só consegue enviar até {_mb(limite)} neste servidor. '
-                        "Use um **link de download** (rode `/entrega_configurar` sem arquivo e preencha o link).")
+    grandes = [a for a in anexos if (a.get("size") or 0) > limite]
+    if grandes:
+        await r.efemera("Grande demais para o bot enviar neste servidor (máximo " + _mb(limite) + " por arquivo): "
+                        + ", ".join(f'**{a.get("filename")}** ({_mb(a["size"])})' for a in grandes)
+                        + ". Nada foi salvo. Para esse, use um **link de download** (`/entrega_configurar` sem arquivo).")
         return
-    resp = await cliente_web().get(anexo["url"], timeout=120)
-    resp.raise_for_status()
-    conteudo, nome = resp.content, re.sub(r"[^\w.\-]+", "_", anexo.get("filename") or "arquivo")[:100]
+    nomes = [re.sub(r"[^A-Za-z0-9.\-]+", "_", unicodedata.normalize("NFKD", a.get("filename") or "arquivo")
+                    .encode("ascii", "ignore").decode()).replace("_.", ".").strip("_")[:100] or "arquivo" for a in anexos]
+    if len(set(nomes)) < len(nomes):
+        await r.efemera("Dois arquivos com o mesmo nome. Renomeie um deles e mande de novo.")
+        return
+    existentes = {x["nome"] for x in _lista_arquivos(jid, plano)}
+    total = len(existentes | set(nomes)) if not remover else len(nomes)
+    if total > MAX_ARQUIVOS_ENTREGA:
+        await r.efemera(f"Cada jogo/plano aceita até {MAX_ARQUIVOS_ENTREGA} arquivos (ficaria com {total}). "
+                        "Use `remover_arquivo: True` junto para trocar todos de uma vez.")
+        return
     canal = await _canal_arquivos_entrega()
-    msg = await dc("POST", f"/channels/{canal}/messages", dados={"payload_json": json.dumps({
-        "content": f"📁 Arquivo de entrega • {_rotulo_jogo(j)} • {alvo} • enviado por <@{quem}>. Não apague.",
-        "allowed_mentions": {"parse": []}, "attachments": [{"id": 0, "filename": nome}]})},
-        arquivos={"files[0]": (nome, conteudo, anexo.get("content_type") or "application/octet-stream")})
+    guardados = []
+    for a, nome in zip(anexos, nomes):
+        resp = await cliente_web().get(a["url"], timeout=120)
+        resp.raise_for_status()
+        msg = await dc("POST", f"/channels/{canal}/messages", dados={"payload_json": json.dumps({
+            "content": f"📁 Arquivo de entrega • {_rotulo_jogo(j)} • {alvo} • enviado por <@{quem}>. Não apague.",
+            "allowed_mentions": {"parse": []}, "attachments": [{"id": 0, "filename": nome}]})},
+            arquivos={"files[0]": (nome, resp.content, a.get("content_type") or "application/octet-stream")})
+        guardados.append((nome, msg["id"], len(resp.content)))
     with _tx() as conn:
-        conn.execute("INSERT INTO entregas_config (jogo, plano, arquivo_canal, arquivo_msg, arquivo_nome, arquivo_tamanho, "
-                     "atualizado_por, atualizado_em) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (jogo, plano) DO UPDATE SET "
-                     "arquivo_canal = excluded.arquivo_canal, arquivo_msg = excluded.arquivo_msg, arquivo_nome = excluded.arquivo_nome, "
-                     "arquivo_tamanho = excluded.arquivo_tamanho, atualizado_por = excluded.atualizado_por, "
-                     "atualizado_em = excluded.atualizado_em",
-                     (jid, plano, canal, msg["id"], nome, len(conteudo), quem, _agora_iso()))
-        _auditar(conn, "arquivo_entrega", None, quem, f"{jid}/{plano}: {nome} ({len(conteudo)} bytes)")
-    await r.efemera(f'📁 Arquivo **{nome}** ({_mb(len(conteudo))}) salvo. Ele vai junto em **toda entrega nova** de '
-                    f'{_rotulo_jogo(j)} ({alvo}), logo depois do passo a passo.\n'
-                    "Para trocar, mande outro arquivo do mesmo jeito; para tirar, use `remover_arquivo: True`.")
-    await registrar_venda_log(f'📁 <@{quem}> configurou o arquivo de entrega de {_rotulo_jogo(j)} ({alvo}): {nome}.')
+        if remover:  # remover + arquivos novos = troca a lista inteira
+            conn.execute("DELETE FROM entregas_arquivos WHERE jogo = ? AND plano = ?", (jid, plano))
+        for nome, mid, tam in guardados:
+            conn.execute("INSERT INTO entregas_arquivos (jogo, plano, nome, canal_id, mensagem_id, tamanho, adicionado_por, adicionado_em) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (jogo, plano, nome) DO UPDATE SET canal_id = excluded.canal_id, "
+                         "mensagem_id = excluded.mensagem_id, tamanho = excluded.tamanho, adicionado_por = excluded.adicionado_por",
+                         (jid, plano, nome, canal, mid, tam, quem, _agora_iso()))
+        _auditar(conn, "arquivos_entrega", None, quem, f"{jid}/{plano}: " + ", ".join(n for n, _, _ in guardados))
+    lista = _lista_arquivos(jid, plano)
+    trocados = [n for n, _, _ in guardados if n in existentes]
+    linhas = "\n".join(f'• 📎 **{x["nome"]}** ({_mb(x["tamanho"] or 0)})' for x in lista)
+    extra = ""
+    if plano != "*" and _lista_arquivos(jid, "*"):
+        extra = "\nℹ️ Os arquivos de **todos os planos** deste jogo também vão junto."
+    await r.efemera(f'📁 Salvo! **{len(lista)}** arquivo(s) vão em **toda entrega nova** de {_rotulo_jogo(j)} ({alvo}), '
+                    f"logo depois do passo a passo:\n{linhas}"
+                    + (f"\n♻️ Substituído(s) pelo novo: {', '.join(trocados)}." if trocados else "") + extra
+                    + "\nPara adicionar mais, mande de novo; para tirar todos, use `remover_arquivo: True`.")
+    await registrar_venda_log(f'📁 <@{quem}> configurou arquivo(s) de entrega de {_rotulo_jogo(j)} ({alvo}): '
+                              + ", ".join(n for n, _, _ in guardados) + ".")
 
 
-def _arquivo_entrega(jid: str, plano: str) -> sqlite3.Row | None:
-    """O arquivo do plano; se o plano não tiver, o do jogo todo."""
-    return _q1("SELECT * FROM entregas_config WHERE jogo = ? AND plano = ? AND arquivo_msg IS NOT NULL", (jid, plano)) or \
-        _q1("SELECT * FROM entregas_config WHERE jogo = ? AND plano = '*' AND arquivo_msg IS NOT NULL", (jid,))
+def _arquivos_entrega(jid: str, plano: str) -> list[sqlite3.Row]:
+    """Os arquivos de todos os planos do jogo + os do plano (com o mesmo nome, vale o do plano)."""
+    por_nome: dict[str, sqlite3.Row] = {}
+    for x in _lista_arquivos(jid, "*") + (_lista_arquivos(jid, plano) if plano != "*" else []):
+        por_nome[x["nome"]] = x
+    return list(por_nome.values())
 
 
 async def _baixar_arquivo_entrega(cfg: sqlite3.Row) -> tuple[str, bytes] | None:
     try:
-        msg = await dc("GET", f'/channels/{cfg["arquivo_canal"]}/messages/{cfg["arquivo_msg"]}')
-        anexo = next((a for a in msg.get("attachments", []) if a["filename"] == cfg["arquivo_nome"]), None) or \
+        msg = await dc("GET", f'/channels/{cfg["canal_id"]}/messages/{cfg["mensagem_id"]}')
+        anexo = next((a for a in msg.get("attachments", []) if a["filename"] == cfg["nome"]), None) or \
             (msg.get("attachments") or [None])[0]
         if not anexo:
             return None
