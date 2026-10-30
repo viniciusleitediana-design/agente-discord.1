@@ -12,6 +12,8 @@ Conector MCP que deixa o Claude controlar o servidor ECO PULSE e mantém automa�
 - **Comandos de barra** (os mesmos do bot antigo): `/ping`, `/loja_painel`, `/vendas`, `/pedidos_pendentes`, `/aprovar_pagamento`, `/ticket_painel`, `/verificacao_painel` (só administradores veem, menos o /ping)
 - **Loja:** painel com botão **Comprar agora** → chat privado (comprador + Fundador) com QR Code e Pix copia e cola → **Confirmar pagamento** com nome completo → o Fundador confirma (o bot cria um **canal privado só do comprador** e manda o produto lá, tirado do canal de estoque; o canal some em 7 dias ou quando o comprador fechar) ou recusa (chat fechado)
 
+- **Central da equipe:** com canais chamados `fila-de-atendimento` e `alertas`, o bot mantém uma fila ao vivo (pagamentos para conferir, tickets sem responsável, aprovados sem estoque, entregas travadas, tickets em atendimento; mais antigos primeiro) e manda 1 alerta por caso novo, mencionando o FUNDADOR só ali
+
 As automações e as compras em andamento ficam salvas no canal privado `#agente-config` do próprio servidor, então sobrevivem a reinícios do Render.
 
 ### Loja
