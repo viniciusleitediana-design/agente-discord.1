@@ -67,7 +67,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 try:  # cofre das keys e credenciais das vendas
@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "3.8"
+VERSAO = "3.9"
 INICIO = time.time()
 
 
@@ -2303,6 +2303,39 @@ def _botoes_sorteio(s: dict) -> dict:
     return _linha({**_botao(rotulo, f'ecos:fim:{s["id"]}', 2, "🔒"), "disabled": True})
 
 
+async def _editar_sorteio(s: dict, titulo: str | None, descricao: str | None, cor: str | None,
+                          imagem_url: str | None, botao_link: str | None) -> dict:
+    """editar_mensagem num sorteio: muda o que fica guardado no sorteio, para a mudança não sumir
+    quando alguém clicar em Participar (o bot redesenha o embed a cada inscrição)."""
+    if botao_link is not None:
+        raise ErroDiscord("O botão do sorteio não pode ser trocado por um link.")
+    if all(v is None for v in (titulo, descricao, cor, imagem_url)):
+        raise ErroDiscord("Num sorteio, dá para mudar titulo, descricao, cor e imagem_url.")
+    if titulo is not None:
+        s["titulo"] = titulo[:256] or None
+    if descricao is not None:
+        if len(descricao) > 3500:
+            raise ErroDiscord("A descrição do sorteio passou de 3500 caracteres.")
+        s["descricao"] = descricao or None
+    if cor is not None:
+        s["cor"] = _cor(cor)
+    if imagem_url is None:
+        await _atualizar_mensagem_sorteio(s)
+    else:
+        s["imagem_url"] = imagem_url or None
+        s.pop("image_arquivo", None)
+        msg = await _postar(s["canal_id"], {"embeds": [_embed_sorteio(s)], "components": [_botoes_sorteio(s)], "attachments": []},
+                            editar_id=s["mensagem_id"])
+        nomes = {a["filename"] for a in msg.get("attachments", [])}
+        url = ((msg.get("embeds") or [{}])[0].get("image") or {}).get("url") or ""
+        arq = url.split("?")[0].rsplit("/", 1)[-1]
+        if arq in nomes:
+            s["image_arquivo"] = arq
+    await salvar_config()
+    mudou = [k for k, v in (("titulo", titulo), ("descricao", descricao), ("cor", cor), ("imagem", imagem_url)) if v is not None]
+    return {"ok": True, "mensagem_id": s["mensagem_id"], "sorteio": s["id"], "mudou": mudou}
+
+
 async def _atualizar_mensagem_sorteio(s: dict) -> None:
     """Reescreve o embed do sorteio mantendo a imagem que foi enviada junto da mensagem."""
     embed = _embed_sorteio(s)
@@ -2854,6 +2887,9 @@ async def editar_mensagem(canal_id: str, mensagem_id: str, texto: str | None = N
     atual = await dc("GET", f'/channels/{canal["id"]}/messages/{mensagem_id}')
     if atual["author"]["id"] != (await eu())["id"]:
         raise ErroDiscord("Só consigo editar mensagens enviadas pelo próprio bot.")
+    sorteio = next((s for s in _cfg.get("sorteios", {}).values() if s.get("mensagem_id") == str(atual["id"])), None)
+    if sorteio:
+        return await _editar_sorteio(sorteio, titulo, descricao, cor, imagem_url, botao_link)
     corpo: dict[str, Any] = {}
     if texto is not None:
         if len(texto) > 2000:
@@ -6412,7 +6448,20 @@ async def ciclo_de_vida(app):
                     await c.aclose()
 
 
-app = Starlette(routes=[Route("/", saude), Route("/saude", saude), *_app_http.routes, *_app_sse.routes],
+PASTA_MIDIA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "midia")
+
+
+async def midia(request):
+    """Imagens públicas do servidor (banners), servidas da pasta midia/ do repositório."""
+    nome = request.path_params["nome"]
+    caminho = os.path.join(PASTA_MIDIA, nome)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+\.(png|jpe?g|gif|webp)", nome) or not os.path.isfile(caminho):
+        return PlainTextResponse("não encontrado", status_code=404)
+    return FileResponse(caminho, headers={"Cache-Control": "public, max-age=86400"})
+
+
+app = Starlette(routes=[Route("/", saude), Route("/saude", saude), Route("/midia/{nome}", midia),
+                        *_app_http.routes, *_app_sse.routes],
                 lifespan=ciclo_de_vida)
 
 
