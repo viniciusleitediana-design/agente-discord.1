@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "3.6"
+VERSAO = "3.7"
 INICIO = time.time()
 
 
@@ -2884,18 +2884,21 @@ async def apagar_mensagem(canal_id: str, mensagem_id: str) -> str:
 
 
 @mcp.tool(annotations=LEITURA)
-async def ler_mensagens(canal_id: str, limite: int = 20) -> dict:
-    """Lê as últimas mensagens de um canal (até 100), da mais antiga para a mais nova."""
+async def ler_mensagens(canal_id: str, limite: int = 20, completo: bool = False) -> dict:
+    """Lê as últimas mensagens de um canal (até 100), da mais antiga para a mais nova.
+    completo=true traz o texto e o embed inteiros (sem cortar), para revisar textos longos como regras."""
     canal = await achar_canal(canal_id, tipos=TIPOS_MENSAGEM)
     msgs = await dc("GET", f'/channels/{canal["id"]}/messages', params={"limit": max(1, min(100, limite))})
     saida, vazias = [], 0
     for m in reversed(msgs):
         item: dict[str, Any] = {"id": m["id"], "autor": m["author"].get("global_name") or m["author"]["username"],
                                 "autor_id": m["author"]["id"], "quando": _fmt(m["timestamp"]),
-                                "texto": (m.get("content") or "")[:600]}
+                                "texto": (m.get("content") or "")[:None if completo else 600]}
         if m.get("embeds"):
             e0 = m["embeds"][0]
-            item["embed"] = "\n".join(x for x in (e0.get("title"), (e0.get("description") or "")[:1500]) if x)
+            item["embed"] = "\n".join(x for x in (e0.get("title"), (e0.get("description") or "")[:None if completo else 1500]) if x)
+            if completo and e0.get("fields"):
+                item["embed"] += "".join(f'\n\n{f.get("name")}\n{f.get("value")}' for f in e0["fields"])
         if m.get("components"):
             item["botoes"] = [b.get("texto") or b.get("tipo") for b in _resumo_componentes(m["components"])]
             opcoes = [f'{o.get("texto")} — {o.get("descricao") or ""}'.strip(" —")
