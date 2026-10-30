@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "4.0"
+VERSAO = "4.1"
 INICIO = time.time()
 
 
@@ -5535,7 +5535,7 @@ async def _executar_entrega(p: sqlite3.Row, key_row: sqlite3.Row | None) -> None
     if login:
         mensagens.append({"embeds": [{"title": "🔐 Seu login", "color": NEON, "description": login[:4096]}]})
     if key_row:
-        mensagens.append({"content": decifrar(key_row["valor_cifrado"])})
+        mensagens.append({"content": f"Key: {decifrar(key_row['valor_cifrado'])}"})
     mensagens[-1]["components"] = [_linha(_botao("Já guardei, fechar canal", f"ecvd:fechar_entrega:{pid}", 2, "🔒"))]
     for m in mensagens:
         m.setdefault("allowed_mentions", {"parse": []})
