@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "3.5"
+VERSAO = "3.6"
 INICIO = time.time()
 
 
@@ -2692,9 +2692,14 @@ async def criar_canal(nome: str, tipo: str = "texto", categoria_id: str | None =
 @mcp.tool()
 async def editar_canal(canal_id: str, nome: str | None = None, topico: str | None = None,
                        categoria_id: str | None = None, posicao: int | None = None,
-                       modo_lento_segundos: int | None = None, nsfw: bool | None = None) -> dict:
+                       modo_lento_segundos: int | None = None, nsfw: bool | None = None,
+                       definir_como: str | None = None) -> dict:
     """Renomeia, muda o tópico, move de categoria (categoria_id = ID/nome, ou "nenhuma" para tirar),
-    muda a posição, o modo lento (segundos, 0 desliga) ou a marcação +18 de um canal."""
+    muda a posição, o modo lento (segundos, 0 desliga) ou a marcação +18 de um canal.
+    posicao = lugar na lista (0 = primeiro): de uma categoria entre as categorias, de um canal dentro da
+    categoria dele (canais de voz contam só entre os de voz). Os outros são empurrados, sem posições repetidas.
+    definir_como = "regras" (canal de regras da Comunidade), "atualizacoes" (avisos do Discord para a
+    moderação) ou "sistema" (entradas e impulsos): troca o canal usado pelo servidor para isso."""
     canal = await achar_canal(canal_id)
     corpo: dict[str, Any] = {}
     if nome is not None:
@@ -2704,16 +2709,46 @@ async def editar_canal(canal_id: str, nome: str | None = None, topico: str | Non
     if categoria_id is not None:
         corpo["parent_id"] = None if _norm(categoria_id) in ("", "nenhuma", "semcategoria", "nada", "none") \
             else (await achar_categoria(categoria_id))["id"]
-    if posicao is not None:
-        corpo["position"] = posicao
     if modo_lento_segundos is not None:
         corpo["rate_limit_per_user"] = max(0, min(21600, int(modo_lento_segundos)))
     if nsfw is not None:
         corpo["nsfw"] = nsfw
-    if not corpo:
-        raise ErroDiscord("Nada para mudar: passe nome, topico, categoria_id, posicao, modo_lento_segundos ou nsfw.")
-    novo = await dc("PATCH", f'/channels/{canal["id"]}', corpo=corpo, motivo="Agente ECO PULSE")
-    return {"ok": True, "id": novo["id"], "nome": novo["name"], "mudou": list(corpo)}
+    campo_servidor = None
+    if definir_como is not None:
+        campo_servidor = {"regras": "rules_channel_id", "atualizacoes": "public_updates_channel_id",
+                          "sistema": "system_channel_id"}.get(_norm(definir_como).replace("canalde", ""))
+        if not campo_servidor:
+            raise ErroDiscord('definir_como aceita "regras", "atualizacoes" ou "sistema".')
+        if canal["type"] != 0:
+            raise ErroDiscord("Só um canal de texto pode ser usado para isso.")
+    if not corpo and posicao is None and not campo_servidor:
+        raise ErroDiscord("Nada para mudar: passe nome, topico, categoria_id, posicao, modo_lento_segundos, nsfw ou definir_como.")
+    novo = canal
+    if corpo:
+        novo = await dc("PATCH", f'/channels/{canal["id"]}', corpo=corpo, motivo="Agente ECO PULSE")
+    mudou = list(corpo)
+    if posicao is not None:
+        await _reposicionar(novo, posicao)
+        mudou.append("position")
+    if campo_servidor:
+        await dc("PATCH", f"/guilds/{await servidor_id()}", corpo={campo_servidor: canal["id"]}, motivo="Agente ECO PULSE")
+        mudou.append(campo_servidor)
+    return {"ok": True, "id": novo["id"], "nome": novo["name"], "mudou": mudou}
+
+
+def _grupo_ordem(c: dict) -> int:
+    """No Discord, categorias se ordenam entre si; dentro de uma categoria, texto vem antes e voz depois."""
+    return 2 if c["type"] == 4 else (1 if c["type"] in (2, 13) else 0)
+
+
+async def _reposicionar(canal: dict, indice: int) -> None:
+    g, pai = _grupo_ordem(canal), canal.get("parent_id") or None
+    irmaos = sorted((c for c in await _canais() if c["id"] != canal["id"] and _grupo_ordem(c) == g
+                     and (g == 2 or (c.get("parent_id") or None) == pai)),
+                    key=lambda c: (c["position"], int(c["id"])))
+    irmaos.insert(max(0, min(int(indice), len(irmaos))), canal)
+    await dc("PATCH", f"/guilds/{await servidor_id()}/channels", motivo="Agente ECO PULSE",
+             corpo=[{"id": c["id"], "position": i} for i, c in enumerate(irmaos)])
 
 
 @mcp.tool(annotations=DESTRUTIVA)
@@ -2776,11 +2811,19 @@ async def enviar_mensagem(canal_id: str, texto: str | None = None, titulo: str |
                           descricao: str | None = None, cor: str | None = None, imagem_url: str | None = None,
                           miniatura_url: str | None = None, rodape: str | None = None,
                           botao_texto: str | None = None, botao_link: str | None = None,
-                          mencionar_todos: bool = False, responder_a: str | None = None) -> dict:
+                          mencionar_todos: bool = False, responder_a: str | None = None,
+                          painel: str | None = None, opcoes_painel: dict | None = None) -> dict:
     """Envia uma mensagem em um canal. Use texto para mensagem simples e/ou titulo + descricao para um
     embed (caixa colorida; cor = #RRGGBB ou verde, azul, vermelho, amarelo, roxo, laranja, rosa, dourado...).
     botao_link adiciona um botão com link. mencionar_todos=true permite @everyone/@here funcionar.
-    responder_a = ID de uma mensagem para responder."""
+    responder_a = ID de uma mensagem para responder.
+    painel = "ticket" ou "verificacao" publica esse painel neste canal (o mesmo que publicar_painel_ticket /
+    publicar_painel_verificacao); opcoes_painel leva os campos deles, ex.: {"cargo": "Membro", "copiar_de": link}."""
+    if painel:
+        func = {"ticket": publicar_painel_ticket, "verificacao": publicar_painel_verificacao}.get(_norm(painel))
+        if not func:
+            raise ErroDiscord('painel aceita "ticket" ou "verificacao".')
+        return await func(canal_id=canal_id, **(opcoes_painel or {}))
     canal = await achar_canal(canal_id, tipos=TIPOS_MENSAGEM)
     payload = montar_mensagem(texto, titulo, descricao, cor, imagem_url, miniatura_url, rodape,
                               botao_texto, botao_link, mencionar_todos)
@@ -3946,7 +3989,9 @@ async def info_servidor() -> dict:
             "online": g.get("approximate_presence_count"), "impulsos": g.get("premium_subscription_count"),
             "nivel_impulso": g.get("premium_tier"), "canais": len([c for c in canais if c["type"] != 4]),
             "categorias": len([c for c in canais if c["type"] == 4]), "cargos": len(g.get("roles", [])),
-            "comunidade": "COMMUNITY" in g.get("features", []), "descricao": g.get("description")}
+            "comunidade": "COMMUNITY" in g.get("features", []), "descricao": g.get("description"),
+            "canal_regras": g.get("rules_channel_id"), "canal_atualizacoes_comunidade": g.get("public_updates_channel_id"),
+            "canal_sistema": g.get("system_channel_id")}
 
 
 @mcp.tool()
