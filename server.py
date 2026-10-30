@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "3.4"
+VERSAO = "3.5"
 INICIO = time.time()
 
 
@@ -1211,8 +1211,7 @@ async def _mandar_pagamento(canal_id: str, prod: dict, compra: dict) -> None:
     qr_url = prod.get("qr_imagem_url")
     passos = []
     if pix:
-        passos.append("Escaneie o **QR Code** abaixo no app do seu banco **ou** copie o código Pix da próxima "
-                      "mensagem (no celular: segure a mensagem → **Copiar texto**).")
+        passos.append("Escaneie o **QR Code** abaixo no app do seu banco **ou** copie o código Pix da próxima mensagem.")
     elif qr_url:
         passos.append("Escaneie o **QR Code** abaixo no app do seu banco.")
     if link:
@@ -5113,9 +5112,6 @@ async def _vendas_menu(r: _Resposta, jid: str, plano: str) -> None:
         msg = await dc("POST", f'/channels/{canal["id"]}/messages', corpo=payload)
     if pix:
         await dc("POST", f'/channels/{canal["id"]}/messages', corpo={"content": pix, "allowed_mentions": {"parse": []}})
-        await dc("POST", f'/channels/{canal["id"]}/messages', corpo={
-            "content": "☝️ Código Pix copia e cola acima (no celular: segure a mensagem → **Copiar texto**).",
-            "allowed_mentions": {"parse": []}})
     else:
         fund = _cfg_vendas("cargo_fundador_id")
         await dc("POST", f'/channels/{canal["id"]}/messages', corpo={
@@ -5395,37 +5391,35 @@ async def _executar_entrega(p: sqlite3.Row, key_row: sqlite3.Row | None) -> None
             conn.execute("UPDATE pedidos SET canal_entrega_id = ? WHERE id = ?", (canal_id, pid))
     agora = _agora()
     expira = (agora + timedelta(days=p["dias"])) if p["dias"] else None
-    campos = [{"name": "🎮 Jogo", "value": _rotulo_jogo(j), "inline": True},
-              {"name": "📦 Produto", "value": p["produto_nome"], "inline": True},
-              {"name": "⏳ Validade", "value": _duracao(p["dias"]), "inline": True},
-              {"name": "🆔 Pedido", "value": f"`{pid}`", "inline": True},
-              {"name": "💰 Valor pago", "value": _reais_c(p["preco_centavos"]), "inline": True}]
-    await dc("POST", f"/channels/{canal_id}/messages", corpo={
+    # Ordem: resumo → passo a passo → login → key sozinha (com o botão de fechar), igual ao "como comprar" do painel.
+    # A key fica numa mensagem só com ela, sem formatação, para "Copiar texto" pegar exatamente a key.
+    instrucoes = []
+    if cfg and cfg["instrucoes"]:
+        instrucoes.append(cfg["instrucoes"])
+    if cfg and cfg["link_download"]:
+        instrucoes.append(f'⬇️ **Download:** {cfg["link_download"]}')
+    login = decifrar(cfg["login_cifrado"]) if cfg and cfg["login_cifrado"] else None
+    abaixo = [x for x, tem in (("o passo a passo", instrucoes), ("o login", login), ("a key", key_row)) if tem]
+    resumo = (f'🎮 **{_rotulo_jogo(j)}**  •  📦 **{p["produto_nome"]}**  •  ⏳ {_duracao(p["dias"])}\n'
+              f'🆔 `{pid}`  •  💰 {_reais_c(p["preco_centavos"])}')
+    aviso = ("\n\n" + (", ".join(abaixo[:-1]) + " e " + abaixo[-1] if len(abaixo) > 1 else abaixo[0]).capitalize()
+             + (" estão" if len(abaixo) > 1 else " está") + " logo abaixo. Guarde em um lugar seguro e **não compartilhe** com ninguém."
+             if abaixo else "")
+    mensagens: list[dict] = [{
         "content": f"<@{uid}>", "allowed_mentions": {"parse": [], "users": [uid]},
-        "embeds": [{"title": "✅ Pagamento aprovado • sua entrega chegou", "color": NEON, "fields": campos,
-                    "description": ("Este canal é **privado**: só você e a equipe conseguem ver.\n"
-                                    "Guarde sua key e as instruções abaixo em um lugar seguro e **não compartilhe** com ninguém."),
-                    "footer": {"text": "ECO CHEATS • Obrigado pela compra!"}}]})
+        "embeds": [{"title": "✅ Pagamento aprovado", "color": NEON,
+                    "description": f"{resumo}\n\n🔒 Canal **privado**: só você e a equipe veem.{aviso}",
+                    "footer": {"text": "ECO CHEATS • Obrigado pela compra!"}}]}]
+    if instrucoes:
+        mensagens.append({"embeds": [{"title": "📖 Passo a passo", "color": NEON, "description": "\n\n".join(instrucoes)[:4096]}]})
+    if login:
+        mensagens.append({"embeds": [{"title": "🔐 Seu login", "color": NEON, "description": login[:4096]}]})
     if key_row:
-        await dc("POST", f"/channels/{canal_id}/messages", corpo={
-            "embeds": [{"title": "🔑 Sua key", "color": NEON,
-                        "description": "A key está na mensagem logo abaixo, sozinha, para facilitar copiar (no celular: segure a mensagem → **Copiar texto**)."}]})
-        await dc("POST", f"/channels/{canal_id}/messages", corpo={"content": decifrar(key_row["valor_cifrado"]), "allowed_mentions": {"parse": []}})
-    if cfg:
-        partes = []
-        if cfg["instrucoes"]:
-            partes.append(f'📖 **Instruções**\n{cfg["instrucoes"]}')
-        if cfg["link_download"]:
-            partes.append(f'⬇️ **Download:** {cfg["link_download"]}')
-        if partes:
-            await dc("POST", f"/channels/{canal_id}/messages", corpo={
-                "embeds": [{"title": "📦 Como usar", "color": NEON, "description": "\n\n".join(partes)[:4096]}]})
-        if cfg["login_cifrado"]:
-            await dc("POST", f"/channels/{canal_id}/messages", corpo={
-                "embeds": [{"title": "🔐 Login de acesso", "color": NEON, "description": decifrar(cfg["login_cifrado"])[:4096]}]})
-    await dc("POST", f"/channels/{canal_id}/messages", corpo={
-        "content": "Já guardou tudo? Se quiser, você pode fechar este canal. Ele **não** é apagado sozinho.",
-        "components": [_linha(_botao("Já guardei, fechar canal", f"ecvd:fechar_entrega:{pid}", 2, "🔒"))]})
+        mensagens.append({"content": decifrar(key_row["valor_cifrado"])})
+    mensagens[-1]["components"] = [_linha(_botao("Já guardei, fechar canal", f"ecvd:fechar_entrega:{pid}", 2, "🔒"))]
+    for m in mensagens:
+        m.setdefault("allowed_mentions", {"parse": []})
+        await dc("POST", f"/channels/{canal_id}/messages", corpo=m)
     with _tx() as conn:
         if key_row:
             conn.execute("UPDATE keys SET status = 'entregue', entregue_em = ?, validade_dias = ?, expira_em = ? WHERE id = ?",
