@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("eco-pulse")
 
-VERSAO = "4.2"
+VERSAO = "4.3"
 INICIO = time.time()
 
 
@@ -5516,7 +5516,9 @@ async def _executar_entrega(p: sqlite3.Row, key_row: sqlite3.Row | None) -> None
     if cfg and cfg["instrucoes"]:
         instrucoes.append(cfg["instrucoes"])
     if cfg and cfg["link_download"]:
-        instrucoes.append(f'⬇️ **Download:** {cfg["link_download"]}')
+        links = [x for x in cfg["link_download"].splitlines() if x.strip()]
+        instrucoes.append(f"⬇️ **Download:** {links[0]}" if len(links) == 1
+                          else "⬇️ **Downloads**\n" + "\n".join(f"• {x}" for x in links))
     login = decifrar(cfg["login_cifrado"]) if cfg and cfg["login_cifrado"] else None
     arquivos, faltando = [], []
     for cfg_arquivo in _arquivos_entrega(p["jogo"], p["plano"]):
@@ -5925,7 +5927,8 @@ async def ao_comando_vendas(r: _Resposta, nome: str, op: dict, dados: dict) -> N
                                      "Passo a passo para usar a key"),
                                campo("login", "Login / acesso (fica cifrado)", 2, 1000,
                                      decifrar(atual["login_cifrado"]) if atual and atual["login_cifrado"] else None, "Opcional"),
-                               campo("link", "Link de download", 1, 300, atual["link_download"] if atual else None, "https://… (opcional)")]})
+                               campo("link", "Links de download (um por linha)", 2, 1000, atual["link_download"] if atual else None,
+                                     "Programa: https://…  (outra linha)  Vídeo: https://…")]})
         return
     await r.adiar()
     if not _vendas["pronto"]:
@@ -6285,9 +6288,13 @@ async def _vendas_modal_entrega(r: _Resposta, jid: str, plano: str) -> None:
     instr = (_valor_modal(inter.data, "instrucoes") or "").strip()
     login = (_valor_modal(inter.data, "login") or "").strip()
     link = (_valor_modal(inter.data, "link") or "").strip()
-    if link and not re.match(r"https?://", link):
-        await r.efemera("O link de download precisa começar com https://")
+    linhas_link = [x.strip() for x in link.splitlines() if x.strip()]
+    sem_link = [x for x in linhas_link if not re.search(r"https?://\S+", x)]
+    if sem_link:
+        await r.efemera("Cada linha dos links precisa ter um endereço começando com https:// (ex.: `Vídeo: https://…`). "
+                        f"Linha sem link: `{sem_link[0][:80]}`")
         return
+    link = "\n".join(linhas_link)
     with _tx() as conn:
         conn.execute("INSERT INTO entregas_config (jogo, plano, instrucoes, login_cifrado, link_download, atualizado_por, atualizado_em) "
                      "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (jogo, plano) DO UPDATE SET instrucoes = excluded.instrucoes, "
