@@ -4,8 +4,8 @@ Conector MCP que deixa o Claude controlar o servidor ECO PULSE e mantém automa�
 
 ## O que faz
 
-- **Canais:** listar, criar (inclusive privados), editar, apagar, permissões, trancar
-- **Mensagens:** enviar com embed e botão de link, editar, ler, limpar em massa, fixar, reagir, enquete, DM
+- **Canais:** listar, criar (inclusive privados), editar, apagar, permissões, trancar. `editar_canal` reordena sem repetir posições (`posicao`, 0 = primeiro) e troca o canal de regras/avisos da Comunidade (`definir_como`)
+- **Mensagens:** enviar com embed e botão de link, editar, ler (`completo=true` traz textos longos inteiros), limpar em massa, fixar, reagir, enquete, DM. `enviar_mensagem` com `painel` = `ticket`/`verificacao` publica esses painéis
 - **Automações:** mensagens agendadas/repetidas, boas-vindas com cargo automático, despedida, respostas automáticas, cargos por reação, canal de registros, filtro de palavras e convites (AutoMod)
 - **Cargos e moderação:** criar/editar/apagar cargos, dar/tirar cargo, apelido, castigo, expulsar, banir, desbanir
 - **Comunidade:** painel de **ticket** (canal privado com a equipe, assumir, fechar com histórico .txt), painel de **verificação** (botão dá cargo), **sorteios** (participar, sorteio automático na hora, ressortear) e `ver_mensagem` + `copiar_de` para copiar painéis de outros bots
