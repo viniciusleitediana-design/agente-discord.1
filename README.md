@@ -1,49 +1,67 @@
-# ECO PULSE — Agente do Discord
+# ECO PULSE Bot
 
-Conector MCP que deixa o Claude controlar o servidor ECO PULSE e mantém automações rodando no próprio bot, 24 horas.
+Bot do Discord do servidor **ECO PULSE**: loja com vendas automáticas por Pix, tickets de suporte, verificação, sorteios, boas-vindas e automações. Também tem um **conector MCP**, que permite administrar o servidor por um assistente de IA.
 
-## O que faz
+Roda 24 horas no Render (plano grátis), em Python, sem banco externo: as configurações e o banco de vendas ficam guardados no próprio Discord.
 
-- **Canais:** listar, criar (inclusive privados), editar, apagar, permissões, trancar. `editar_canal` reordena sem repetir posições (`posicao`, 0 = primeiro) e troca o canal de regras/avisos da Comunidade (`definir_como`)
-- **Mensagens:** enviar com embed e botão de link, editar, ler (`completo=true` traz textos longos inteiros), limpar em massa, fixar, reagir, enquete, DM. `enviar_mensagem` com `painel` = `ticket`/`verificacao` publica esses painéis
-- **Automações:** mensagens agendadas/repetidas, boas-vindas com cargo automático, despedida, respostas automáticas, cargos por reação, canal de registros, filtro de palavras e convites (AutoMod)
-- **Cargos e moderação:** criar/editar/apagar cargos, dar/tirar cargo, apelido, castigo, expulsar, banir, desbanir
-- **Comunidade:** painel de **ticket** (canal privado com a equipe, assumir, fechar com histórico .txt), painel de **verificação** (botão dá cargo), **sorteios** (participar, sorteio automático na hora, ressortear) e `ver_mensagem` + `copiar_de` para copiar painéis de outros bots
-- **Comandos de barra** (os mesmos do bot antigo): `/ping`, `/loja_painel`, `/vendas`, `/pedidos_pendentes`, `/aprovar_pagamento`, `/ticket_painel`, `/verificacao_painel` (só administradores veem, menos o /ping)
-- **Loja:** painel com botão **Comprar agora** → chat privado (comprador + Fundador) com QR Code e Pix copia e cola → **Confirmar pagamento** com nome completo → o Fundador confirma (o bot cria um **canal privado só do comprador** e manda o produto lá, tirado do canal de estoque; o canal some em 7 dias ou quando o comprador fechar) ou recusa (chat fechado)
+## Funcionalidades
 
-- **Central da equipe:** com canais chamados `fila-de-atendimento` e `alertas`, o bot mantém uma fila ao vivo (pagamentos para conferir, tickets sem responsável, aprovados sem estoque, entregas travadas, tickets em atendimento; mais antigos primeiro) e manda 1 alerta por caso novo, mencionando o FUNDADOR só ali
+| Área | O que faz |
+| --- | --- |
+| **Vendas de keys** | Painel com menu de planos em cada canal de jogo. Gera o Pix (QR Code e copia e cola) com o valor exato num canal privado de pagamento. O cliente informa o nome de quem pagou e o FUNDADOR confere e aprova. A entrega sai num canal privado com passo a passo, arquivos, login e key. O estoque fica num cofre cifrado. |
+| **Loja simples** | Produto com botão "Comprar agora", Pix e entrega automática, com conteúdo fixo ou estoque por mensagem. |
+| **Central da equipe** | Fila de atendimento ao vivo, com os pedidos mais antigos primeiro: pagamentos para conferir, tickets sem responsável, pedidos sem estoque e entregas travadas. Alertas chegam num canal só. |
+| **Tickets** | Canal privado com a equipe, botão de assumir e fechamento com histórico em `.txt`. |
+| **Verificação** | Botão que dá o cargo de membro. |
+| **Sorteios** | Botão de participar, sorteio automático na hora marcada, ressorteio e cancelamento. |
+| **Automações** | Boas-vindas (canal e DM), despedida, mensagens agendadas, respostas automáticas, cargos por reação, registros e filtro de palavras. |
+| **Conector MCP** | 55 ferramentas para administrar canais, mensagens, cargos, membros, painéis e vendas. |
 
-As automações e as compras em andamento ficam salvas no canal privado `#agente-config` do próprio servidor, então sobrevivem a reinícios do Render.
+## Estrutura
 
-### Loja
+```
+server.py                 ponto de entrada (python server.py)
+ecopulse/
+├── config.py             variáveis de ambiente e constantes
+├── estado.py             estado compartilhado (conexões, banco, tarefas)
+├── discord_api.py        chamadas REST ao Discord e respostas a interações
+├── util.py · busca.py · interface.py · pix.py
+├── memoria.py            configuração salva num canal privado do servidor
+├── agendamento.py        rotinas a cada 20 s e mensagens agendadas
+├── gateway.py            eventos em tempo real e roteamento das interações
+├── comandos.py           comandos de barra (/)
+├── central.py            fila de atendimento e alertas da equipe
+├── loja.py · paineis.py · tickets.py · verificacao.py · sorteios.py
+├── conector.py           servidor MCP
+├── ferramentas/          ferramentas do conector (canais, mensagens, cargos…)
+├── vendas/               vendas automáticas (banco, cofre, backup, compra, entrega…)
+└── app.py                aplicação web, rotas e ciclo de vida
+midia/                    imagens públicas (banners)
+tests/                    testes com um Discord falso
+docs/                     guias de configuração, comandos e arquitetura
+```
 
-- Ferramentas do conector: `configurar_produto`, `publicar_painel_compra`, `ver_loja`
-- Estoque: cada mensagem no canal de estoque do produto = 1 entrega (a mais antiga sai primeiro; mensagens fixadas são ignoradas)
-- Conteúdo fixo (`conteudo_fixo=true`): a mensagem mais recente do canal vai para todos os compradores e não é apagada
-- Chats sem pagamento informado fecham sozinhos em 24 h; depois da entrega, fecham em 5 min
+## Começando
 
-### Vendas automáticas de keys (ECO CHEATS)
+```bash
+pip install -r requirements.txt
+export DISCORD_TOKEN=...      # token do bot
+export CHAVE_SECRETA=...      # caminho secreto do conector
+python server.py
+```
 
-- **Painéis**: 1 por canal de jogo (pelos IDs dos canais): CS2, Roblox Emulador, Roblox Mobile, Free Fire Emulador, Free Fire Mobile. Menu com Key 1 dia (R$ 3,90), 7 dias (R$ 17,90), 15 dias (R$ 32,90), 30 dias (R$ 54,90) e permanente (R$ 99,00), com preço e estoque. Os IDs das mensagens ficam no banco: reiniciar só atualiza, nunca duplica.
-- **Compra**: escolher no menu → pedido no SQLite (`ECO-XXXXXXXX`) → canal privado `venda-painel-[jogo]-[nome]` (cliente, bot e FUNDADOR) com QR Code, Pix copia e cola do valor exato, link opcional e os botões CONFIRMAR PAGAMENTO / CANCELAR PEDIDO.
-- **Pagamento**: CONFIRMAR PAGAMENTO abre formulário com o nome completo do pagador → AGUARDANDO_CONFERENCIA → o FUNDADOR é avisado e vê APROVAR / REJEITAR.
-- **Aprovação**: só o cargo FUNDADOR (checado no servidor em todo clique e formulário). Aprovar exige digitar CONFIRMO; fica registrado quem e quando; nunca aprova nem entrega duas vezes. Rejeitar pede o motivo e avisa o cliente.
-- **Entrega**: NOVO canal privado `entrega-[jogo]-[nome]` com a key (do cofre), instruções, login, link e arquivos configurados (`/entrega_configurar` com `arquivo`, `arquivo2`, `arquivo3`: até 5 por jogo/plano, guardados em `📁・arquivos-entrega` e mandados em toda entrega; mesmo nome substitui; até 10 MB cada sem impulso). Sem key no estoque: o pedido fica AGUARDANDO_ESTOQUE, o FUNDADOR é avisado e a entrega sai sozinha quando keys forem adicionadas. Canais de entrega não são apagados automaticamente.
-- **Comandos** (só FUNDADOR): `/produto_configurar`, `/key_adicionar`, `/key_estoque`, `/key_consultar`, `/key_revogar`, `/entrega_configurar`, `/pedido_consultar`, `/pedidos_pendentes`, `/painel_vendas_publicar`, `/painel_vendas_atualizar`.
-- **Segurança**: SQLite com transações; keys, logins e nomes de pagadores cifrados (variável `CHAVE_COFRE`, não troque depois de cadastrar keys); auditoria de cada passo; pedidos sem pagamento expiram em 24 h; canais de pagamento encerrados são apagados com atraso controlado.
-- **Persistência**: o disco do Render é apagado a cada deploy, então o banco é copiado para o canal privado `🗄️・backups-bot` depois de cada alteração (últimas 10 cópias) e restaurado ao ligar. Não apague esse canal.
-- **Validade**: o bot não ativa nem desativa keys no programa; a validade é só informação administrativa.
+No Render, use o build `pip install -r requirements.txt` e o start `python server.py`. O passo a passo completo está em [docs/CONFIGURACAO.md](docs/CONFIGURACAO.md).
 
-## Render
+## Documentação
 
-- Build: `pip install -r requirements.txt`
-- Start: `python server.py`
-- Variáveis: `DISCORD_TOKEN` (obrigatória), `GUILD_ID`, `CHAVE_SECRETA`, `FUSO`, `MANTER_ACORDADO` (opcionais; detalhes no topo do `server.py`)
-- Loja: `PIX_CHAVE` (a chave Pix que recebe), `PIX_NOME` e `PIX_CIDADE` (opcionais), `PIX_LINK` (link de pagamento opcional)
-- Vendas: `CHAVE_COFRE` (chave Fernet que cifra keys, logins e nomes; não troque depois de usar)
+- [Configuração](docs/CONFIGURACAO.md): variáveis de ambiente, Render, Developer Portal e primeiros passos
+- [Comandos](docs/COMANDOS.md): comandos de barra e as 55 ferramentas do conector
+- [Arquitetura](docs/ARQUITETURA.md): como o bot é organizado e como os dados ficam salvos
 
-## Discord
+## Testes
 
-- Developer Portal → Bot: ligar **SERVER MEMBERS INTENT** e **MESSAGE CONTENT INTENT**
-- Cargo do bot com **Administrador** e acima dos cargos que ele gerencia
+```bash
+python tests/rodar_testes.py
+```
+
+Os testes usam um Discord simulado (`tests/fake_discord*.py`), então nenhuma mensagem é enviada de verdade. A bateria cobre vendas, entrega, central da equipe, tickets, sorteios, comandos, conector e reinícios do serviço.
