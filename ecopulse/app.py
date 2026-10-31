@@ -18,6 +18,13 @@ from .conector import mcp
 from .config import CHAVE, PORTA, RAIZ_PROJETO, log
 from .vendas.comandos import COMANDOS_VENDAS, _NOMES_VENDAS
 
+# As ferramentas do conector se registram ao importar o módulo (decorator @mcp.tool):
+# todas precisam ser importadas aqui, senão o Claude não as enxerga.
+from .ferramentas import (  # noqa: F401
+    automacoes, canais, cargos, leitura, loja, membros, mensagens, servidor, sorteios, tickets, verificacao,
+)
+from .vendas import status  # noqa: F401
+
 COMANDOS.extend(COMANDOS_VENDAS)
 _NOMES_COMANDOS.update(_NOMES_VENDAS)
 
